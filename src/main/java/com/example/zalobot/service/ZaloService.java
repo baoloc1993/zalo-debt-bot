@@ -12,10 +12,16 @@ public class ZaloService {
 
     private final ZaloConfig zaloConfig;
     private final WebClient webClient;
+    private final GeminiApiClient geminiApiClient;
 
-    public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder) {
+    public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient) {
         this.zaloConfig = zaloConfig;
         this.webClient = webClientBuilder.baseUrl("https://openapi.zalo.me/v2.0").build();
+        this.geminiApiClient = geminiApiClient;
+    }
+
+    public Mono<String> handleGeminiCommand(String command) {
+        return geminiApiClient.generateContent(command);
     }
 
     public Mono<String> exchangeCodeForAccessToken(String code) {

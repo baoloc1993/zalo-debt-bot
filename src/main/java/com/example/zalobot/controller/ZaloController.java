@@ -38,4 +38,9 @@ public class ZaloController {
                 .thenReturn("Access token obtained successfully!")
                 .onErrorResume(e -> Mono.just("Error obtaining access token: " + e.getMessage()));
     }
+
+    @PostMapping("/zalo/gemini/command")
+    public Mono<String> handleGeminiCommand(@RequestBody String command) {
+        return zaloService.handleGeminiCommand(command);
+    }
 }
