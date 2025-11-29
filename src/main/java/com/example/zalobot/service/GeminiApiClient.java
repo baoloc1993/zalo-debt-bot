@@ -1,10 +1,13 @@
 package com.example.zalobot.service;
 
+import org.springframework.web.reactive.function.client.WebClient;
+import java.util.List;
+import com.example.zalobot.model.gemini.GeminiMessage;
+import com.example.zalobot.model.gemini.GeminiRequest;
 import com.example.zalobot.model.gemini.GeminiResponse;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,13 +29,10 @@ public class GeminiApiClient {
         this.geminiApiUrl = geminiApiUrl;
     }
 
-    public Mono<String> generateContent(String prompt) {
-        String requestBody = String.format(
-                "{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}",
-                prompt
-        );
+    public Mono<String> generateContent(List<GeminiMessage> messages) {
+        GeminiRequest requestBody = new GeminiRequest(messages);
 
-        logger.info("Sending request to Gemini API with prompt: {}", prompt);
+        logger.info("Sending request to Gemini API with messages: {}", messages);
 
         return webClient.post()
                 .uri(uriBuilder -> uriBuilder.path("/v1beta/models/gemini-2.5-flash:generateContent").queryParam("key", geminiApiKey).build())
