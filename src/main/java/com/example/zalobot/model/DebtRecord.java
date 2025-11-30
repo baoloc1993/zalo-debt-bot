@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -22,6 +23,7 @@ public class DebtRecord {
     @Column(name = "zalo_message_id")
     private Long zaloMessageId; // Liên kết với tin nhắn Zalo gốc
 
+    @ToString.Exclude
     @ManyToOne
     @JoinColumn(name = "app_user_id", nullable = false)
     private AppUser appUser;

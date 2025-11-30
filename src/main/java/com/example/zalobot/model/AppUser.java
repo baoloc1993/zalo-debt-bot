@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -24,6 +25,7 @@ public class AppUser {
     @Column(name = "zalo_id", unique = true)
     private String zaloId;
 
+    @ToString.Exclude
     @OneToMany(mappedBy = "appUser", cascade = CascadeType.ALL, orphanRemoval = true)
     private Set<UserAlias> aliases = new HashSet<>();
 }
