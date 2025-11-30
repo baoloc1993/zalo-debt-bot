@@ -7,7 +7,10 @@ import lombok.NoArgsConstructor;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class DebtAnalysisResult {
-    private boolean isDebtRelated;
+public class TransactionAnalysisResult {
+    private String transactionType;
+    private boolean isTransactionRelated;
+    private boolean isSummaryRequest;
+    private String summaryType;
     private String analysisJson;
 }

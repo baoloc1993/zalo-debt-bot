@@ -5,6 +5,7 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 
@@ -21,11 +22,12 @@ public class DebtRecord {
     @Column(name = "zalo_message_id")
     private Long zaloMessageId; // Liên kết với tin nhắn Zalo gốc
 
-    @Column(name = "debtor_name")
-    private String debtorName;
+    @ManyToOne
+    @JoinColumn(name = "app_user_id", nullable = false)
+    private AppUser appUser;
 
-    @Column(name = "amount")
-    private String amount; // Sử dụng String để xử lý các định dạng tiền tệ khác nhau
+    @Column(name = "amount", precision = 19, scale = 4) // Sử dụng BigDecimal cho số tiền
+    private BigDecimal amount;
 
     @Column(name = "reason", length = 1000)
     private String reason;

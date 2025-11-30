@@ -79,8 +79,8 @@ public class ZaloController {
                     logger.debug("Processing incoming Zalo message for debt analysis.");
                     return zaloService.processIncomingZaloMessage(senderId, messageText)
                             .flatMap(debtAnalysisResult -> {
-                                logger.info("Debt analysis result for senderId {}: isDebtRelated={}, rawData={}", senderId, debtAnalysisResult.isDebtRelated(), debtAnalysisResult.getAnalysisJson());
-                                if (debtAnalysisResult.isDebtRelated()) {
+                                logger.info("Debt analysis result for senderId {}: isTransactionRelated={}, rawData={}", senderId, debtAnalysisResult.isTransactionRelated(), debtAnalysisResult.getAnalysisJson());
+                                if (debtAnalysisResult.isTransactionRelated()) {
                                     String debtResponse = "Tin nhắn này có vẻ liên quan đến việc nợ tiền. Tôi đã ghi nhận thông tin chi tiết.";
                                     return zaloService.sendMessage(senderId, debtResponse)
                                             .doOnSuccess(response -> logger.info("Successfully sent debt-related message to Zalo: {}", response))
