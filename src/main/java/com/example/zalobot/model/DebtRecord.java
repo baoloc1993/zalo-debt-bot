@@ -25,8 +25,13 @@ public class DebtRecord {
 
     @ToString.Exclude
     @ManyToOne
-    @JoinColumn(name = "app_user_id", nullable = false)
-    private AppUser appUser;
+    @JoinColumn(name = "debtor_user_id", nullable = false)
+    private AppUser debtorUser;
+
+    @ToString.Exclude
+    @ManyToOne
+    @JoinColumn(name = "creditor_user_id", nullable = false)
+    private AppUser creditorUser;
 
     @Column(name = "amount", precision = 19, scale = 4) // Sử dụng BigDecimal cho số tiền
     private BigDecimal amount;

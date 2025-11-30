@@ -95,7 +95,7 @@ public class ZaloService {
 
     public Mono<TransactionAnalysisResult> analyzeMessageForDebt(String messageContent) {
         List<GeminiMessage> prompt = List.of(
-                new GeminiMessage("user", List.of(new GeminiMessage.Part("Bạn là một trợ lý phân tích tin nhắn. Hãy kiểm tra xem tin nhắn sau có đề cập đến giao dịch nợ hoặc thanh toán hay không, hoặc có yêu cầu tổng hợp nợ/thanh toán hay không. Nếu có giao dịch, hãy trích xuất các thông tin sau: tên người liên quan (người nợ hoặc người trả), số tiền giao dịch, lý do giao dịch, và ngày giao dịch (nếu có). Nếu có yêu cầu tổng hợp, hãy xác định loại tổng hợp (nợ, thanh toán, hoặc tất cả). Trả về kết quả dưới dạng JSON với các trường: 'is_transaction_related' (boolean), 'transaction_type' (string, 'debt' hoặc 'payment'), 'app_user_id' (long, ID của người dùng trong hệ thống, nếu có), 'app_user_name' (string, tên người dùng), 'amount' (number), 'reason' (string), 'transaction_date' (string, định dạng YYYY-MM-DD), 'is_summary_request' (boolean), 'summary_type' (string, 'debt', 'payment', 'all'). Nếu không có thông tin, hãy để giá trị là null hoặc chuỗi rỗng. Ví dụ: Tin nhắn: 'Tôi nợ Lan 50k tiền ăn trưa.' -> {'is_transaction_related': true, 'transaction_type': 'debt', 'app_user_name': 'Lan', 'amount': 50000, 'reason': 'tiền ăn trưa', 'transaction_date': null, 'is_summary_request': false, 'summary_type': null}. Tin nhắn: " + messageContent))));
+                new GeminiMessage("user", List.of(new GeminiMessage.Part("Bạn là một trợ lý phân tích tin nhắn. Hãy kiểm tra xem tin nhắn sau có đề cập đến giao dịch nợ hoặc thanh toán hay không, hoặc có yêu cầu tổng hợp nợ/thanh toán hay không. Nếu có giao dịch, hãy trích xuất các thông tin sau: tên người liên quan (người nợ hoặc người trả), số tiền giao dịch, lý do giao dịch, và ngày giao dịch (nếu có). Đồng thời, xác định hướng của khoản nợ: nếu người dùng hiện tại nợ người khác, hãy đặt 'debt_direction' là 'USER_OWES_OTHER'; nếu người khác nợ người dùng hiện tại, hãy đặt 'debt_direction' là 'OTHER_OWES_USER'. Nếu có yêu cầu tổng hợp, hãy xác định loại tổng hợp (nợ, thanh toán, hoặc tất cả). Trả về kết quả dưới dạng JSON với các trường: 'is_transaction_related' (boolean), 'transaction_type' (string, 'debt' hoặc 'payment'), 'debt_direction' (string, 'USER_OWES_OTHER' hoặc 'OTHER_OWES_USER'), 'app_user_id' (long, ID của người dùng trong hệ thống, nếu có), 'app_user_name' (string, tên người dùng), 'amount' (number), 'reason' (string), 'transaction_date' (string, định dạng YYYY-MM-DD), 'is_summary_request' (boolean), 'summary_type' (string, 'debt', 'payment', 'all'). Nếu không có thông tin, hãy để giá trị là null hoặc chuỗi rỗng. Ví dụ: Tin nhắn: 'Tôi nợ Lan 50k tiền ăn trưa.' -> {'is_transaction_related': true, 'transaction_type': 'debt', 'debt_direction': 'USER_OWES_OTHER', 'app_user_name': 'Lan', 'amount': 50000, 'reason': 'tiền ăn trưa', 'transaction_date': null, 'is_summary_request': false, 'summary_type': null}. Tin nhắn: 'Lan nợ tôi 50k tiền ăn trưa.' -> {'is_transaction_related': true, 'transaction_type': 'debt', 'debt_direction': 'OTHER_OWES_USER', 'app_user_name': 'Lan', 'amount': 50000, 'reason': 'tiền ăn trưa', 'transaction_date': null, 'is_summary_request': false, 'summary_type': null}. Tin nhắn: " + messageContent))));
         return geminiApiClient.generateContent(prompt)
                 .map(geminiResponse -> {
                     String cleanedResponse = geminiResponse.replace("```json", "").replace("```", "").trim();
@@ -103,14 +103,13 @@ public class ZaloService {
                         JsonObject jsonResponse = JsonParser.parseString(cleanedResponse).getAsJsonObject();
                         boolean isTransactionRelated = jsonResponse.has("is_transaction_related") && jsonResponse.get("is_transaction_related").getAsBoolean();
                         String transactionType = jsonResponse.has("transaction_type") && !jsonResponse.get("transaction_type").isJsonNull() ? jsonResponse.get("transaction_type").getAsString() : null;
+                        String debtDirection = jsonResponse.has("debt_direction") && !jsonResponse.get("debt_direction").isJsonNull() ? jsonResponse.get("debt_direction").getAsString() : null;
                         boolean isSummaryRequest = jsonResponse.has("is_summary_request") && jsonResponse.get("is_summary_request").getAsBoolean();
                         String summaryType = jsonResponse.has("summary_type") && !jsonResponse.get("summary_type").isJsonNull() ? jsonResponse.get("summary_type").getAsString() : null;
-                        return new TransactionAnalysisResult(transactionType, isTransactionRelated, isSummaryRequest, summaryType, cleanedResponse);
+                        return new TransactionAnalysisResult(transactionType, debtDirection, isTransactionRelated, isSummaryRequest, summaryType, cleanedResponse);
                     } catch (Exception e) {
-                        // Log error and return a default non-transaction related result
                         logger.error("Error parsing Gemini transaction analysis response: {}", e.getMessage());
-                        // Return a default valid JSON string in case of parsing error
-                        return new TransactionAnalysisResult(null, false, false, null, "{}");
+                        return new TransactionAnalysisResult(null, null, false, false, null, "{}");
                     }
                 });
     }
@@ -118,6 +117,16 @@ public class ZaloService {
     @Transactional
     public Mono<TransactionAnalysisResult> processIncomingZaloMessage(String senderId, String messageText) {
         logger.debug("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageText);
+
+        // Ensure sender AppUser exists
+        AppUser senderAppUser = appUserRepository.findByZaloId(senderId).orElseGet(() -> {
+            AppUser newSenderAppUser = new AppUser();
+            newSenderAppUser.setZaloId(senderId);
+            newSenderAppUser.setName(senderId); // Default name to senderId, can be updated later
+            return appUserRepository.save(newSenderAppUser);
+        });
+        logger.debug("Sender AppUser ID: {} for Zalo ID: {}", senderAppUser.getId(), senderId);
+
         Optional<PendingUserConfirmation> pendingConfirmation = pendingUserConfirmationRepository
                 .findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
 
@@ -227,6 +236,8 @@ public class ZaloService {
 
                             String reason = jsonResponse.has("reason") && !jsonResponse.get("reason").isJsonNull() ? jsonResponse.get("reason").getAsString() : null;
 
+
+
                             if ("debt".equals(transactionAnalysisResult.getTransactionType())) {
                                 String dueDateStr = jsonResponse.has("transaction_date") && !jsonResponse.get("transaction_date").isJsonNull() ? jsonResponse.get("transaction_date").getAsString() : null;
 
@@ -241,12 +252,23 @@ public class ZaloService {
 
                                 DebtRecord debtRecord = new DebtRecord();
                                 debtRecord.setZaloMessageId(savedMessage.getId());
-                                debtRecord.setAppUser(appUser);
                                 debtRecord.setAmount(amount);
                                 debtRecord.setReason(reason);
                                 debtRecord.setDueDate(dueDate);
+
+                                if ("USER_OWES_OTHER".equals(transactionAnalysisResult.getDebtDirection())) {
+                                    debtRecord.setDebtorUser(senderAppUser);
+                                    debtRecord.setCreditorUser(appUser);
+                                } else if ("OTHER_OWES_USER".equals(transactionAnalysisResult.getDebtDirection())) {
+                                    debtRecord.setDebtorUser(appUser);
+                                    debtRecord.setCreditorUser(senderAppUser);
+                                } else {
+                                    logger.error("Unknown debt direction: {}", transactionAnalysisResult.getDebtDirection());
+                                    sendMessage(senderId, "Không thể xác định hướng nợ. Vui lòng thử lại.").subscribe();
+                                    return;
+                                }
                                 debtRecordRepository.save(debtRecord);
-                                logger.info("Saved new DebtRecord with ID: {} for AppUser ID: {}", debtRecord.getId(), debtRecord.getAppUser().getId());
+                                logger.info("Saved new DebtRecord with ID: {} for Debtor User ID: {} and Creditor User ID: {}", debtRecord.getId(), debtRecord.getDebtorUser().getId(), debtRecord.getCreditorUser().getId());
                             } else if ("payment".equals(transactionAnalysisResult.getTransactionType())) {
                                 PaymentRecord paymentRecord = new PaymentRecord();
                                 paymentRecord.setZaloMessageId(savedMessage.getId());
@@ -354,7 +376,7 @@ public class ZaloService {
     }
 
     private Mono<String> getSummaryForAppUser(AppUser appUser, String summaryType) {
-        Mono<BigDecimal> totalDebtMono = Mono.just(debtRecordRepository.sumAmountByAppUser(appUser));
+        Mono<BigDecimal> totalDebtMono = Mono.just(debtRecordRepository.sumAmountWhereUserIsCreditor(appUser));
         Mono<BigDecimal> totalPaymentMono = Mono.just(paymentRecordRepository.sumAmountByAppUser(appUser));
 
         return Mono.zip(totalDebtMono, totalPaymentMono)
@@ -392,34 +414,38 @@ public class ZaloService {
         PendingUserConfirmation confirmation = pendingConfirmationOptional.get();
         String lowerCaseResponse = response.trim().toLowerCase();
 
-        if (lowerCaseResponse.equals("có") || lowerCaseResponse.equals("yes")) {
-            // User confirmed, create new AppUser and UserAlias
-            AppUser newAppUser = new AppUser();
-            newAppUser.setName(confirmation.getUnresolvedName());
-            AppUser savedAppUser = appUserRepository.save(newAppUser);
-            logger.debug("DEBUG: Created new AppUser with ID: {} and name: {}", savedAppUser.getId(), savedAppUser.getName());
+            if (lowerCaseResponse.equals("có")) {
+                // User confirmed the name
+                AppUser newAppUser = new AppUser();
+                newAppUser.setName(confirmation.getUnresolvedName());
+                newAppUser.setZaloId(UUID.randomUUID().toString()); // Generate a unique Zalo ID for the new user
+                appUserRepository.save(newAppUser);
+                logger.debug("DEBUG: Created new AppUser with ID: {} and name: {}", newAppUser.getId(), newAppUser.getName());
 
-            UserAlias newUserAlias = new UserAlias();
-            newUserAlias.setAlias(senderId); // Zalo senderId as alias
-            newUserAlias.setAppUser(savedAppUser);
-            userAliasRepository.save(newUserAlias); // Using userAliasRepository to save alias
-            logger.debug("DEBUG: Created new UserAlias for senderId: {} linked to AppUser ID: {}", senderId, savedAppUser.getId());
+                UserAlias userAlias = new UserAlias();
+                userAlias.setAlias(senderId);
+                userAlias.setAppUser(newAppUser);
+                userAliasRepository.save(userAlias);
+                logger.debug("DEBUG: Created new UserAlias for senderId: {} linked to AppUser ID: {}", senderId, newAppUser.getId());
 
-            confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
-            pendingUserConfirmationRepository.save(confirmation);
-            logger.debug("DEBUG: PendingUserConfirmation status updated to CONFIRMED for senderId: {}", senderId);
+                confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
+                pendingUserConfirmationRepository.save(confirmation);
+                logger.debug("DEBUG: PendingUserConfirmation status updated to CONFIRMED for senderId: {}", senderId);
+                sendMessage(senderId, "Đã xác nhận tên \"" + confirmation.getUnresolvedName() + "\". Đang xử lý lại tin nhắn gốc.").subscribe();
 
-            sendMessage(senderId, "Đã xác nhận và tạo người dùng mới '" + savedAppUser.getName() + "'. Cảm ơn bạn!").subscribe();
-        } else if (lowerCaseResponse.equals("không") || lowerCaseResponse.equals("no")) {
-            confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.DENIED);
-            pendingUserConfirmationRepository.save(confirmation);
-            System.out.println("DEBUG: PendingUserConfirmation status updated to DENIED for senderId: " + senderId);
-            sendMessage(senderId, "Đã hủy yêu cầu xác nhận.").subscribe();
-        }
-        else {
-            sendMessage(senderId, "Phản hồi không hợp lệ. Vui lòng trả lời 'có' hoặc 'không'.").subscribe();
-            confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.DENIED);
-            pendingUserConfirmationRepository.save(confirmation);
-        }
+                // Re-process the original message
+                processIncomingZaloMessage(senderId, confirmation.getOriginalMessage())
+                        .subscribe(
+                                result -> logger.info("Re-processed original message after confirmation: {}", confirmation.getOriginalMessage()),
+                                error -> logger.error("Error re-processing original message after confirmation: {}", error.getMessage())
+                        );
+
+            } else if (lowerCaseResponse.equals("không")) {
+                confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.DENIED);
+                pendingUserConfirmationRepository.save(confirmation);
+                sendMessage(senderId, "Đã hủy xác nhận. Vui lòng nhập lại tin nhắn với tên rõ ràng hơn.").subscribe();
+            } else {
+                sendMessage(senderId, "Phản hồi không hợp lệ. Vui lòng trả lời 'có' hoặc 'không'.").subscribe();
+            }
     }
 }

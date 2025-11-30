@@ -9,6 +9,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class TransactionAnalysisResult {
     private String transactionType;
+    private String debtDirection; // "USER_OWES_OTHER" or "OTHER_OWES_USER"
     private boolean isTransactionRelated;
     private boolean isSummaryRequest;
     private String summaryType;
