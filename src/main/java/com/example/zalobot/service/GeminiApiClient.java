@@ -33,6 +33,7 @@ public class GeminiApiClient {
         GeminiRequest requestBody = new GeminiRequest(messages);
 
         logger.info("Sending request to Gemini API with messages: {}", messages);
+        logger.debug("Gemini API Request Body: {}", requestBody);
 
         return webClient.post()
                 .uri(uriBuilder -> uriBuilder.path("/v1beta/models/gemini-2.5-flash:generateContent").queryParam("key", geminiApiKey).build())

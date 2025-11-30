@@ -7,6 +7,7 @@ import com.example.zalobot.model.DebtRecord;
 import com.example.zalobot.model.gemini.GeminiMessage;
 import com.example.zalobot.model.PaymentRecord;
 import com.example.zalobot.model.PendingUserConfirmation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.HashSet;
 import com.example.zalobot.model.TransactionAnalysisResult;
@@ -94,7 +95,7 @@ public class ZaloService {
 
     public Mono<TransactionAnalysisResult> analyzeMessageForDebt(String messageContent) {
         List<GeminiMessage> prompt = List.of(
-                new GeminiMessage("user", List.of(new GeminiMessage.Part("Bạn là một trợ lý phân tích tin nhắn. Hãy kiểm tra xem tin nhắn sau có đề cập đến giao dịch nợ hoặc thanh toán hay không, hoặc có yêu cầu tổng hợp nợ/thanh toán hay không. Nếu có giao dịch, hãy trích xuất các thông tin sau: tên người liên quan (người nợ hoặc người trả), số tiền giao dịch, lý do giao dịch, và ngày giao dịch (nếu có). Nếu có yêu cầu tổng hợp, hãy xác định loại tổng hợp (nợ, thanh toán, hoặc tất cả). Trả về kết quả dưới dạng JSON với các trường: 'is_transaction_related' (boolean), 'transaction_type' (string, 'debt' hoặc 'payment'), 'app_user_id' (long, ID của người dùng trong hệ thống, nếu có), 'app_user_name' (string, tên người dùng), 'amount' (number), 'reason' (string), 'transaction_date' (string, định dạng YYYY-MM-DD), 'is_summary_request' (boolean), 'summary_type' (string, 'debt', 'payment', 'all'). Nếu không có thông tin, hãy để giá trị là null hoặc chuỗi rỗng. Tin nhắn: " + messageContent))));
+                new GeminiMessage("user", List.of(new GeminiMessage.Part("Bạn là một trợ lý phân tích tin nhắn. Hãy kiểm tra xem tin nhắn sau có đề cập đến giao dịch nợ hoặc thanh toán hay không, hoặc có yêu cầu tổng hợp nợ/thanh toán hay không. Nếu có giao dịch, hãy trích xuất các thông tin sau: tên người liên quan (người nợ hoặc người trả), số tiền giao dịch, lý do giao dịch, và ngày giao dịch (nếu có). Nếu có yêu cầu tổng hợp, hãy xác định loại tổng hợp (nợ, thanh toán, hoặc tất cả). Trả về kết quả dưới dạng JSON với các trường: 'is_transaction_related' (boolean), 'transaction_type' (string, 'debt' hoặc 'payment'), 'app_user_id' (long, ID của người dùng trong hệ thống, nếu có), 'app_user_name' (string, tên người dùng), 'amount' (number), 'reason' (string), 'transaction_date' (string, định dạng YYYY-MM-DD), 'is_summary_request' (boolean), 'summary_type' (string, 'debt', 'payment', 'all'). Nếu không có thông tin, hãy để giá trị là null hoặc chuỗi rỗng. Ví dụ: Tin nhắn: 'Tôi nợ Lan 50k tiền ăn trưa.' -> {'is_transaction_related': true, 'transaction_type': 'debt', 'app_user_name': 'Lan', 'amount': 50000, 'reason': 'tiền ăn trưa', 'transaction_date': null, 'is_summary_request': false, 'summary_type': null}. Tin nhắn: " + messageContent))));
         return geminiApiClient.generateContent(prompt)
                 .map(geminiResponse -> {
                     String cleanedResponse = geminiResponse.replace("```json", "").replace("```", "").trim();
@@ -114,8 +115,9 @@ public class ZaloService {
                 });
     }
 
+    @Transactional
     public Mono<TransactionAnalysisResult> processIncomingZaloMessage(String senderId, String messageText) {
-        logger.debug("DEBUG: Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageText);
+        logger.debug("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageText);
         Optional<PendingUserConfirmation> pendingConfirmation = pendingUserConfirmationRepository
                 .findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
 
@@ -165,6 +167,11 @@ public class ZaloService {
                         }
 
                         if (appUser == null) {
+                            if (appUserName == null || appUserName.trim().isEmpty()) {
+                                logger.warn("appUserName is null or empty for summary request. Cannot trigger user confirmation flow.");
+                                sendMessage(senderId, "Không thể xác định tên người dùng. Vui lòng cung cấp tên người dùng rõ ràng hơn.").subscribe();
+                                return;
+                            }
                             triggerUserConfirmationFlow(senderId, appUserName, messageText);
                             return;
                         }
@@ -199,6 +206,11 @@ public class ZaloService {
                             }
 
                             if (appUser == null) {
+                                if (appUserName == null || appUserName.trim().isEmpty()) {
+                                    logger.warn("appUserName is null or empty for transaction-related message. Cannot trigger user confirmation flow.");
+                                    sendMessage(senderId, "Không thể xác định tên người dùng. Vui lòng cung cấp tên người dùng rõ ràng hơn.").subscribe();
+                                    return;
+                                }
                                 logger.debug("DEBUG: appUser is still null after resolution attempt. Triggering confirmation flow for unresolved name: {}", appUserName);
                                 triggerUserConfirmationFlow(senderId, appUserName, messageText);
                                 return;
@@ -234,7 +246,7 @@ public class ZaloService {
                                 debtRecord.setReason(reason);
                                 debtRecord.setDueDate(dueDate);
                                 debtRecordRepository.save(debtRecord);
-                                logger.info("Saved new DebtRecord: {}", debtRecord);
+                                logger.info("Saved new DebtRecord with ID: {} for AppUser ID: {}", debtRecord.getId(), debtRecord.getAppUser().getId());
                             } else if ("payment".equals(transactionAnalysisResult.getTransactionType())) {
                                 PaymentRecord paymentRecord = new PaymentRecord();
                                 paymentRecord.setZaloMessageId(savedMessage.getId());
@@ -242,7 +254,7 @@ public class ZaloService {
                                 paymentRecord.setAmount(amount);
                                 paymentRecord.setReason(reason);
                                 paymentRecordRepository.save(paymentRecord);
-                                logger.info("Saved new PaymentRecord: {}", paymentRecord);
+                                logger.info("Saved new PaymentRecord with ID: {} for AppUser ID: {}", paymentRecord.getId(), paymentRecord.getAppUser().getId());
                             } else {
                                 logger.info("Unknown transaction type: {}", transactionAnalysisResult.getTransactionType());
                             }
@@ -367,6 +379,7 @@ public class ZaloService {
                 });
     }
 
+    @Transactional
     public void handleConfirmationResponse(String senderId, String response) {
         logger.debug("DEBUG: Entering handleConfirmationResponse for senderId: {} with response: {}", senderId, response);
         Optional<PendingUserConfirmation> pendingConfirmationOptional = pendingUserConfirmationRepository.findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
@@ -402,6 +415,7 @@ public class ZaloService {
             pendingUserConfirmationRepository.save(confirmation);
             System.out.println("DEBUG: PendingUserConfirmation status updated to DENIED for senderId: " + senderId);
             sendMessage(senderId, "Đã hủy yêu cầu xác nhận.").subscribe();
+        }
         else {
             sendMessage(senderId, "Phản hồi không hợp lệ. Vui lòng trả lời 'có' hoặc 'không'.").subscribe();
             confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.DENIED);
