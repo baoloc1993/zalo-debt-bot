@@ -2,14 +2,19 @@ package com.example.zalobot.service;
 
 import java.math.BigDecimal;
 import com.example.zalobot.model.AppUser;
+import com.example.zalobot.model.UserAlias;
 import com.example.zalobot.model.DebtRecord;
 import com.example.zalobot.model.gemini.GeminiMessage;
 import com.example.zalobot.model.PaymentRecord;
+import com.example.zalobot.model.PendingUserConfirmation;
+
+import java.util.HashSet;
 import com.example.zalobot.model.TransactionAnalysisResult;
 import com.example.zalobot.model.ZaloMessage;
 import com.example.zalobot.repository.AppUserRepository;
 import com.example.zalobot.repository.DebtRecordRepository;
 import com.example.zalobot.repository.PaymentRecordRepository;
+import com.example.zalobot.repository.PendingUserConfirmationRepository;
 import com.example.zalobot.repository.ZaloMessageRepository;
 import com.example.zalobot.config.ZaloConfig;
 import com.example.zalobot.service.GeminiApiClient;
@@ -22,6 +27,8 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.springframework.stereotype.Service;
@@ -38,9 +45,11 @@ public class ZaloService {
     private final DebtRecordRepository debtRecordRepository;
     private final AppUserRepository appUserRepository;
     private final PaymentRecordRepository paymentRecordRepository;
+    private final EntityResolutionService entityResolutionService;
+    private final PendingUserConfirmationRepository pendingUserConfirmationRepository;
     private final Gson gson = new Gson();
 
-    public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository) {
+    public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository) {
         this.zaloConfig = zaloConfig;
         this.webClient = webClientBuilder.baseUrl("https://openapi.zalo.me/v2.0").build();
         this.geminiApiClient = geminiApiClient;
@@ -48,6 +57,8 @@ public class ZaloService {
         this.debtRecordRepository = debtRecordRepository;
         this.appUserRepository = appUserRepository;
         this.paymentRecordRepository = paymentRecordRepository;
+        this.entityResolutionService = entityResolutionService;
+        this.pendingUserConfirmationRepository = pendingUserConfirmationRepository;
     }
 
     public Mono<String> handleGeminiCommand(String senderId, String command) {
@@ -80,22 +91,34 @@ public class ZaloService {
                 new GeminiMessage("user", List.of(new GeminiMessage.Part("Bạn là một trợ lý phân tích tin nhắn. Hãy kiểm tra xem tin nhắn sau có đề cập đến giao dịch nợ hoặc thanh toán hay không, hoặc có yêu cầu tổng hợp nợ/thanh toán hay không. Nếu có giao dịch, hãy trích xuất các thông tin sau: tên người liên quan (người nợ hoặc người trả), số tiền giao dịch, lý do giao dịch, và ngày giao dịch (nếu có). Nếu có yêu cầu tổng hợp, hãy xác định loại tổng hợp (nợ, thanh toán, hoặc tất cả). Trả về kết quả dưới dạng JSON với các trường: 'is_transaction_related' (boolean), 'transaction_type' (string, 'debt' hoặc 'payment'), 'app_user_id' (long, ID của người dùng trong hệ thống, nếu có), 'app_user_name' (string, tên người dùng), 'amount' (number), 'reason' (string), 'transaction_date' (string, định dạng YYYY-MM-DD), 'is_summary_request' (boolean), 'summary_type' (string, 'debt', 'payment', 'all'). Nếu không có thông tin, hãy để giá trị là null hoặc chuỗi rỗng. Tin nhắn: " + messageContent))));
         return geminiApiClient.generateContent(prompt)
                 .map(geminiResponse -> {
+                    String cleanedResponse = geminiResponse.replace("```json", "").replace("```", "").trim();
                     try {
-                        JsonObject jsonResponse = JsonParser.parseString(geminiResponse).getAsJsonObject();
+                        JsonObject jsonResponse = JsonParser.parseString(cleanedResponse).getAsJsonObject();
                         boolean isTransactionRelated = jsonResponse.has("is_transaction_related") && jsonResponse.get("is_transaction_related").getAsBoolean();
                         String transactionType = jsonResponse.has("transaction_type") && !jsonResponse.get("transaction_type").isJsonNull() ? jsonResponse.get("transaction_type").getAsString() : null;
                         boolean isSummaryRequest = jsonResponse.has("is_summary_request") && jsonResponse.get("is_summary_request").getAsBoolean();
                         String summaryType = jsonResponse.has("summary_type") && !jsonResponse.get("summary_type").isJsonNull() ? jsonResponse.get("summary_type").getAsString() : null;
-                        return new TransactionAnalysisResult(transactionType, isTransactionRelated, isSummaryRequest, summaryType, geminiResponse);
+                        return new TransactionAnalysisResult(transactionType, isTransactionRelated, isSummaryRequest, summaryType, cleanedResponse);
                     } catch (Exception e) {
                         // Log error and return a default non-transaction related result
                         System.err.println("Error parsing Gemini transaction analysis response: " + e.getMessage());
-                        return new TransactionAnalysisResult(null, false, false, null, geminiResponse);
+                        // Return a default valid JSON string in case of parsing error
+                        return new TransactionAnalysisResult(null, false, false, null, "{}");
                     }
                 });
     }
 
     public Mono<TransactionAnalysisResult> processIncomingZaloMessage(String senderId, String messageText) {
+        Optional<PendingUserConfirmation> pendingConfirmation = pendingUserConfirmationRepository
+                .findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
+
+        if (pendingConfirmation.isPresent()) {
+            handleConfirmationResponse(senderId, messageText);
+            return Mono.empty();
+        }
+
+
+
         // Save user message to DB
         ZaloMessage userZaloMessage = new ZaloMessage();
         userZaloMessage.setSenderId(senderId);
@@ -104,14 +127,20 @@ public class ZaloService {
         userZaloMessage.setMessageType("text");
         userZaloMessage.setTimestamp(LocalDateTime.now());
         userZaloMessage.setDirection(ZaloMessage.Direction.inbound);
-        userZaloMessage.setRawData(gson.toJson(Map.of("original_message", messageText)));
+        String initialRawData = gson.toJson(Map.of("original_message", messageText));
+        System.out.println("DEBUG: Initial rawData for userZaloMessage: " + initialRawData);
+        userZaloMessage.setRawData(initialRawData);
         ZaloMessage savedMessage = zaloMessageRepository.save(userZaloMessage);
+        System.out.println("DEBUG: Saved userZaloMessage with ID: " + savedMessage.getId() + ", rawData: " + savedMessage.getRawData());
 
         return analyzeMessageForDebt(messageText)
                 .doOnNext(transactionAnalysisResult -> {
                     // Update the saved message with debt analysis result
-                    savedMessage.setRawData(transactionAnalysisResult.getAnalysisJson());
+                    String analysisJson = transactionAnalysisResult.getAnalysisJson();
+                    System.out.println("DEBUG: Analysis JSON from Gemini: " + analysisJson);
+                    savedMessage.setRawData(analysisJson);
                     zaloMessageRepository.save(savedMessage);
+                    System.out.println("DEBUG: Updated savedMessage with analysisJson. New rawData: " + savedMessage.getRawData());
 
                     if (transactionAnalysisResult.isSummaryRequest()) {
                         JsonObject jsonResponse = JsonParser.parseString(transactionAnalysisResult.getAnalysisJson()).getAsJsonObject();
@@ -124,16 +153,11 @@ public class ZaloService {
                         }
 
                         if (appUser == null && appUserName != null && !appUserName.trim().isEmpty()) {
-                            appUser = appUserRepository.findByName(appUserName)
-                                    .orElseGet(() -> {
-                                        AppUser newAppUser = new AppUser(null, appUserName);
-                                        return appUserRepository.save(newAppUser);
-                                    });
+                            appUser = entityResolutionService.resolveUser(appUserName).orElse(null);
                         }
 
                         if (appUser == null) {
-                            System.err.println("AppUser not found and cannot be created for summary request.");
-                            sendMessage(senderId, "Không tìm thấy người dùng để tổng hợp. Vui lòng cung cấp tên hoặc ID người dùng hợp lệ.").subscribe();
+                            triggerUserConfirmationFlow(senderId, appUserName, messageText);
                             return;
                         }
 
@@ -155,15 +179,11 @@ public class ZaloService {
                             }
 
                             if (appUser == null && appUserName != null && !appUserName.trim().isEmpty()) {
-                                appUser = appUserRepository.findByName(appUserName)
-                                        .orElseGet(() -> {
-                                            AppUser newAppUser = new AppUser(null, appUserName);
-                                            return appUserRepository.save(newAppUser);
-                                        });
+                                appUser = entityResolutionService.resolveUser(appUserName).orElse(null);
                             }
 
                             if (appUser == null) {
-                                System.err.println("AppUser not found and cannot be created, skipping transaction record.");
+                                triggerUserConfirmationFlow(senderId, appUserName, messageText);
                                 return;
                             }
 
@@ -267,6 +287,25 @@ public class ZaloService {
         return Mono.just("Messages read successfully (placeholder)");
     }
 
+    private void triggerUserConfirmationFlow(String senderId, String unresolvedName, String originalMessage) {
+        PendingUserConfirmation confirmation = new PendingUserConfirmation();
+        confirmation.setUnresolvedName(unresolvedName);
+        confirmation.setSenderId(senderId);
+        confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.PENDING);
+        confirmation.setCreatedAt(LocalDateTime.now());
+        confirmation.setMessageId(UUID.randomUUID().toString());
+        confirmation.setOriginalMessage(originalMessage);
+        pendingUserConfirmationRepository.save(confirmation);
+
+        String confirmationMessage = String.format(
+            "Tôi không tìm thấy người dùng nào có tên '%s'. " +
+            "Họ có phải là người dùng mới không? (trả lời 'có' hoặc 'không')",
+            unresolvedName
+        );
+
+        sendMessage(senderId, confirmationMessage).subscribe();
+    }
+
     public Mono<String> sendMessage(String recipientId, String message) {
         JsonObject recipient = new JsonObject();
         recipient.addProperty("user_id", recipientId);
@@ -309,5 +348,32 @@ public class ZaloService {
                     }
                     return summary.toString();
                 });
+    }
+
+    public void handleConfirmationResponse(String senderId, String messageText) {
+        pendingUserConfirmationRepository.findBySenderIdAndStatus(
+            senderId, PendingUserConfirmation.ConfirmationStatus.PENDING
+        ).ifPresent(confirmation -> {
+            if ("có".equalsIgnoreCase(messageText.trim())) {
+                // Create new user
+                AppUser newAppUser = new AppUser();
+                newAppUser.setName(confirmation.getUnresolvedName());
+                appUserRepository.save(newAppUser);
+
+                confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
+                pendingUserConfirmationRepository.save(confirmation);
+
+                // Reprocess the original message
+                sendMessage(senderId, "Đã tạo người dùng mới. Đang xử lý lại tin nhắn gốc...").subscribe();
+                processIncomingZaloMessage(senderId, confirmation.getOriginalMessage()).subscribe();
+
+            } else if ("không".equalsIgnoreCase(messageText.trim())) {
+                confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.DENIED);
+                pendingUserConfirmationRepository.save(confirmation);
+                sendMessage(senderId, "Cảm ơn bạn đã xác nhận. Vui lòng cung cấp tên người dùng chính xác.").subscribe();
+            } else {
+                sendMessage(senderId, "Vui lòng trả lời 'có' hoặc 'không'.").subscribe();
+            }
+        });
     }
 }
