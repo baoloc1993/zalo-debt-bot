@@ -45,3 +45,10 @@ implementation 'mysql:mysql-connector-java:8.0.33'
 tasks.named('test') {
 	useJUnitPlatform()
 }
+
+bootRun {
+    systemProperties = System.getenv().collectEntries { name, value ->
+        [(name): value]
+    }
+}
+

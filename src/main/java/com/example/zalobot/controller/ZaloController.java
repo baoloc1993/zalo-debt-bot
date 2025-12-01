@@ -30,10 +30,6 @@ public class ZaloController {
         return zaloService.getProfile(userId);
     }
 
-    @GetMapping("/zalo/messages/read")
-    public Mono<String> readZaloMessages() {
-        return zaloService.readMessages();
-    }
 
     @PostMapping("/zalo/messages/send")
     public Mono<String> sendZaloMessage(@RequestParam String recipientId, @RequestParam String message) {

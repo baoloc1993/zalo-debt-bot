@@ -57,11 +57,6 @@ public class ZaloService {
     private final UserAliasRepository userAliasRepository;
     private final Gson gson = new Gson();
 
-    @Value("${zalo.access.token}")
-    private String initialAccessToken;
-    @Value("${zalo.refresh.token}")
-    private String initialRefreshToken;
-
     public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository) {
         this.zaloConfig = zaloConfig;
         this.webClient = webClientBuilder.baseUrl("https://openapi.zalo.me/v2.0").build();
@@ -73,30 +68,42 @@ public class ZaloService {
         this.entityResolutionService = entityResolutionService;
         this.pendingUserConfirmationRepository = pendingUserConfirmationRepository;
         this.userAliasRepository = userAliasRepository;
+    }
 
-        // Set initial tokens from application.properties
-        this.zaloConfig.setAccessToken(initialAccessToken);
-        this.zaloConfig.setRefreshToken(initialRefreshToken);
+    public ZaloConfig getZaloConfig() {
+        return zaloConfig;
     }
 
     public Mono<String> refreshAccessToken() {
+        logger.info("ZaloService - Entering refreshAccessToken method.");
+        String currentAccessToken = zaloConfig.getAccessToken();
+        if (currentAccessToken != null && !currentAccessToken.isEmpty()) {
+            logger.info("Access token already exists in ZaloConfig, skipping refresh.");
+            return Mono.just("Access token already exists, refresh skipped.");
+        }
         logger.info("Refreshing Zalo access token...");
         String refreshToken = zaloConfig.getRefreshToken();
         if (refreshToken == null || refreshToken.isEmpty()) {
             logger.error("Zalo refresh token is not configured.");
             return Mono.error(new RuntimeException("Zalo refresh token is not configured."));
         }
+        logger.info("ZaloService - Refresh token from ZaloConfig: {}", refreshToken != null ? refreshToken.substring(0, Math.min(refreshToken.length(), 10)) + "..." : "null");
+        logger.info("ZaloService - App Secret from ZaloConfig: {}", zaloConfig.getAppSecret() != null ? zaloConfig.getAppSecret().substring(0, Math.min(zaloConfig.getAppSecret().length(), 10)) + "..." : "null");
+        String requestBody = "app_id=" + zaloConfig.getAppId() +
+                "&app_secret=" + zaloConfig.getAppSecret() +
+                "&refresh_token=" + refreshToken +
+                "&grant_type=refresh_token";
+        logger.info("ZaloService - Refresh token request body: {}", requestBody);
 
+        logger.info("ZaloService - Building WebClient for token refresh.");
         return WebClient.builder().baseUrl("https://oauth.zalo.me/v4").build().post()
                 .uri("/access_token")
                 .contentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED)
-                .bodyValue("app_id=" + zaloConfig.getAppId() +
-                        "&app_secret=" + zaloConfig.getAppSecret() +
-                        "&refresh_token=" + refreshToken +
-                        "&grant_type=refresh_token")
+                .bodyValue(requestBody)
                 .retrieve()
                 .bodyToMono(String.class)
-                .doOnNext(response -> {
+                .doOnEach(signal -> logger.info("ZaloService - WebClient signal after bodyToMono: {}", signal.getType()))
+                .doOnSuccess(response -> {
                     logger.info("Zalo Token Refresh Endpoint Response: {}", response);
                     JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
                     if (jsonResponse.has("error")) {
@@ -109,7 +116,8 @@ public class ZaloService {
                     zaloConfig.setAccessToken(newAccessToken);
                     zaloConfig.setRefreshToken(newRefreshToken);
                     logger.info("New Access Token obtained.");
-                });
+                })
+                .doOnError(e -> logger.error("Error during Zalo token refresh: {}", e.getMessage()));
     }
 
     public Mono<String> handleGeminiCommand(String senderId, String command) {
@@ -160,7 +168,7 @@ public class ZaloService {
 
     @Transactional
     public Mono<TransactionAnalysisResult> processIncomingZaloMessage(String senderId, String messageText) {
-        logger.debug("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageText);
+        logger.info("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageText);
 
         // Ensure sender AppUser exists
         AppUser senderAppUser = appUserRepository.findByZaloId(senderId).orElseGet(() -> {
@@ -169,7 +177,7 @@ public class ZaloService {
             newSenderAppUser.setName(senderId); // Default name to senderId, can be updated later
             return appUserRepository.save(newSenderAppUser);
         });
-        logger.debug("Sender AppUser ID: {} for Zalo ID: {}", senderAppUser.getId(), senderId);
+        logger.info("Sender AppUser ID: {} for Zalo ID: {}", senderAppUser.getId(), senderId);
 
         Optional<PendingUserConfirmation> pendingConfirmation = pendingUserConfirmationRepository
                 .findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
@@ -190,21 +198,21 @@ public class ZaloService {
         userZaloMessage.setTimestamp(LocalDateTime.now());
         userZaloMessage.setDirection(ZaloMessage.Direction.inbound);
         String initialRawData = gson.toJson(Map.of("original_message", messageText));
-        logger.debug("Initial rawData for userZaloMessage: {}", initialRawData);
+        logger.info("Initial rawData for userZaloMessage: {}", initialRawData);
         userZaloMessage.setRawData(initialRawData);
         ZaloMessage savedMessage = zaloMessageRepository.save(userZaloMessage);
-        logger.debug("Saved userZaloMessage with ID: {}, rawData: {}", savedMessage.getId(), savedMessage.getRawData());
+        logger.info("Saved userZaloMessage with ID: {}, rawData: {}", savedMessage.getId(), savedMessage.getRawData());
 
         return analyzeMessageForDebt(messageText)
                 .doOnNext(transactionAnalysisResult -> {
                     // Update the saved message with debt analysis result
                     String analysisJson = transactionAnalysisResult.getAnalysisJson();
-                    logger.debug("Analysis JSON from Gemini: {}", analysisJson);
+                    logger.info("Analysis JSON from Gemini: {}", analysisJson);
                     savedMessage.setRawData(analysisJson);
                     zaloMessageRepository.save(savedMessage);
-                    logger.debug("Updated savedMessage with analysisJson. New rawData: {}", savedMessage.getRawData());
+                    logger.info("Updated savedMessage with analysisJson. New rawData: {}", savedMessage.getRawData());
 
-                    logger.debug("DEBUG: Entering doOnNext block after transaction analysis. isTransactionRelated: {}", transactionAnalysisResult.isTransactionRelated());
+                    logger.info("DEBUG: Entering doOnNext block after transaction analysis. isTransactionRelated: {}", transactionAnalysisResult.isTransactionRelated());
                     if (transactionAnalysisResult.isSummaryRequest()) {
                         JsonObject jsonResponse = JsonParser.parseString(transactionAnalysisResult.getAnalysisJson()).getAsJsonObject();
                         String appUserName = jsonResponse.has("app_user_name") && !jsonResponse.get("app_user_name").isJsonNull() ? jsonResponse.get("app_user_name").getAsString() : null;
@@ -238,9 +246,9 @@ public class ZaloService {
                     } else if (transactionAnalysisResult.isTransactionRelated()) {
                         try {
                             JsonObject jsonResponse = JsonParser.parseString(transactionAnalysisResult.getAnalysisJson()).getAsJsonObject();
-                            logger.debug("DEBUG: Parsed JSON response from Gemini: {}", jsonResponse.toString());
+                            logger.info("DEBUG: Parsed JSON response from Gemini: {}", jsonResponse.toString());
                             String appUserName = jsonResponse.has("app_user_name") && !jsonResponse.get("app_user_name").isJsonNull() ? jsonResponse.get("app_user_name").getAsString() : null;
-                            logger.debug("DEBUG: Extracted appUserName from Gemini response: {}", appUserName);
+                            logger.info("DEBUG: Extracted appUserName from Gemini response: {}", appUserName);
                             Long appUserId = jsonResponse.has("app_user_id") && !jsonResponse.get("app_user_id").isJsonNull() ? jsonResponse.get("app_user_id").getAsLong() : null;
 
                             AppUser appUser = null;
@@ -249,12 +257,12 @@ public class ZaloService {
                             }
 
                             if (appUser == null && appUserName != null && !appUserName.trim().isEmpty()) {
-                                logger.debug("DEBUG: Attempting to resolve user with name: {}", appUserName);
+                                logger.info("DEBUG: Attempting to resolve user with name: {}", appUserName);
                                 appUser = entityResolutionService.resolveUser(appUserName).orElse(null);
                                 if (appUser == null) {
-                                    logger.debug("DEBUG: User with name {} not resolved. Triggering confirmation flow.", appUserName);
+                                    logger.info("DEBUG: User with name {} not resolved. Triggering confirmation flow.", appUserName);
                                 } else {
-                                    logger.debug("DEBUG: User with name {} resolved to AppUser ID: {}", appUserName, appUser.getId());
+                                    logger.info("DEBUG: User with name {} resolved to AppUser ID: {}", appUserName, appUser.getId());
                                 }
                             }
 
@@ -264,7 +272,7 @@ public class ZaloService {
                                     sendMessage(senderId, "Không thể xác định tên người dùng. Vui lòng cung cấp tên người dùng rõ ràng hơn.").subscribe();
                                     return;
                                 }
-                                logger.debug("DEBUG: appUser is still null after resolution attempt. Triggering confirmation flow for unresolved name: {}", appUserName);
+                                logger.info("DEBUG: appUser is still null after resolution attempt. Triggering confirmation flow for unresolved name: {}", appUserName);
                                 triggerUserConfirmationFlow(senderId, appUserName, messageText);
                                 return;
                             }
@@ -554,6 +562,13 @@ public class ZaloService {
         requestBody.add("recipient", recipient);
         requestBody.add("message", messageBody);
 
+        logger.info("Sending message to recipientId: {} with content: {}", recipientId, message);
+            String accessToken = zaloConfig.getAccessToken();
+            logger.info("ZaloConfig Access Token: {}", accessToken);
+            logger.info("ZaloConfig Refresh Token: {}", zaloConfig.getRefreshToken());
+        logger.info("DEBUG: Access Token in sendMessage: {}", accessToken != null ? accessToken.substring(0, Math.min(accessToken.length(), 10)) + "..." : "null");
+        logger.info("DEBUG: Refresh Token in sendMessage: {}", zaloConfig.getRefreshToken() != null ? zaloConfig.getRefreshToken().substring(0, Math.min(zaloConfig.getRefreshToken().length(), 10)) + "..." : "null");
+
         return webClient.post()
                 .uri(uriBuilder -> uriBuilder.path("/oa/message").queryParam("access_token", zaloConfig.getAccessToken()).build())
                 .bodyValue(requestBody.toString())
@@ -589,10 +604,10 @@ public class ZaloService {
 
     @Transactional
     public void handleConfirmationResponse(String senderId, String response) {
-        logger.debug("DEBUG: Entering handleConfirmationResponse for senderId: {} with response: {}", senderId, response);
+        logger.info("DEBUG: Entering handleConfirmationResponse for senderId: {} with response: {}", senderId, response);
         Optional<PendingUserConfirmation> pendingConfirmationOptional = pendingUserConfirmationRepository.findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
         if (pendingConfirmationOptional.isEmpty()) {
-            logger.debug("DEBUG: No pending confirmation found for senderId: {}", senderId);
+            logger.info("DEBUG: No pending confirmation found for senderId: {}", senderId);
             sendMessage(senderId, "Không có yêu cầu xác nhận nào đang chờ xử lý.").subscribe();
             return;
         }
@@ -606,13 +621,13 @@ public class ZaloService {
                 newAppUser.setName(confirmation.getUnresolvedName());
                 newAppUser.setZaloId(UUID.randomUUID().toString()); // Generate a unique Zalo ID for the new user
                 appUserRepository.save(newAppUser);
-                logger.debug("DEBUG: Created new AppUser with ID: {} and name: {}", newAppUser.getId(), newAppUser.getName());
+                logger.info("DEBUG: Created new AppUser with ID: {} and name: {}", newAppUser.getId(), newAppUser.getName());
 
                 UserAlias userAlias = new UserAlias();
                 userAlias.setAlias(senderId);
                 userAlias.setAppUser(newAppUser);
                 userAliasRepository.save(userAlias);
-                logger.debug("DEBUG: Created new UserAlias for senderId: {} linked to AppUser ID: {}", senderId, newAppUser.getId());
+                logger.info("DEBUG: Created new UserAlias for senderId: {} linked to AppUser ID: {}", senderId, newAppUser.getId());
 
                 confirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
                 pendingUserConfirmationRepository.save(confirmation);
