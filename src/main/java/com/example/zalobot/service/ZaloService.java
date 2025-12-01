@@ -38,6 +38,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Flux;
+import org.springframework.beans.factory.annotation.Value;
 
 @Service
 public class ZaloService {
@@ -55,6 +57,11 @@ public class ZaloService {
     private final UserAliasRepository userAliasRepository;
     private final Gson gson = new Gson();
 
+    @Value("${zalo.access.token}")
+    private String initialAccessToken;
+    @Value("${zalo.refresh.token}")
+    private String initialRefreshToken;
+
     public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository) {
         this.zaloConfig = zaloConfig;
         this.webClient = webClientBuilder.baseUrl("https://openapi.zalo.me/v2.0").build();
@@ -66,6 +73,43 @@ public class ZaloService {
         this.entityResolutionService = entityResolutionService;
         this.pendingUserConfirmationRepository = pendingUserConfirmationRepository;
         this.userAliasRepository = userAliasRepository;
+
+        // Set initial tokens from application.properties
+        this.zaloConfig.setAccessToken(initialAccessToken);
+        this.zaloConfig.setRefreshToken(initialRefreshToken);
+    }
+
+    public Mono<String> refreshAccessToken() {
+        logger.info("Refreshing Zalo access token...");
+        String refreshToken = zaloConfig.getRefreshToken();
+        if (refreshToken == null || refreshToken.isEmpty()) {
+            logger.error("Zalo refresh token is not configured.");
+            return Mono.error(new RuntimeException("Zalo refresh token is not configured."));
+        }
+
+        return WebClient.builder().baseUrl("https://oauth.zalo.me/v4").build().post()
+                .uri("/access_token")
+                .contentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED)
+                .bodyValue("app_id=" + zaloConfig.getAppId() +
+                        "&app_secret=" + zaloConfig.getAppSecret() +
+                        "&refresh_token=" + refreshToken +
+                        "&grant_type=refresh_token")
+                .retrieve()
+                .bodyToMono(String.class)
+                .doOnNext(response -> {
+                    logger.info("Zalo Token Refresh Endpoint Response: {}", response);
+                    JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
+                    if (jsonResponse.has("error")) {
+                        String errorDescription = jsonResponse.get("error_description").getAsString();
+                        logger.error("Error from Zalo token refresh endpoint: {}", errorDescription);
+                        throw new RuntimeException("Error refreshing access token: " + errorDescription);
+                    }
+                    String newAccessToken = jsonResponse.get("access_token").getAsString();
+                    String newRefreshToken = jsonResponse.get("refresh_token").getAsString();
+                    zaloConfig.setAccessToken(newAccessToken);
+                    zaloConfig.setRefreshToken(newRefreshToken);
+                    logger.info("New Access Token obtained.");
+                });
     }
 
     public Mono<String> handleGeminiCommand(String senderId, String command) {
@@ -332,10 +376,152 @@ public class ZaloService {
                 .bodyToMono(String.class);
     }
 
-    public Mono<String> readMessages() {
-        System.out.println("Reading messages from Zalo API...");
-        // TODO: Implement actual Zalo API call to read messages
-        return Mono.just("Messages read successfully (placeholder)");
+    public Mono<String> readMessages(List<String> targetUserIds) {
+        // TODO: Validate Zalo API endpoints /oa/latestmsg and /oa/message with official documentation once accessible.
+        logger.info("Scheduled task: Reading Zalo messages...");
+        String accessToken = zaloConfig.getAccessToken();
+        if (accessToken == null || accessToken.isEmpty()) {
+            logger.error("Zalo access token is not configured.");
+            return Mono.just("Error: Zalo access token is not configured.");
+        }
+
+        if (targetUserIds != null && !targetUserIds.isEmpty()) {
+            // Logic for specific users
+            return Flux.fromIterable(targetUserIds)
+                    .flatMap(userId -> {
+                        logger.info("Fetching messages for specific user ID: {}", userId);
+                        // Assuming /oa/message can take user_id directly or we need to find conversation_id first.
+                        // For now, let's assume conversation_id is equivalent to user_id for direct messages or can be used interchangeably.
+                        // This is a placeholder and needs validation with actual Zalo API docs.
+                        return webClient.get()
+                                .uri(uriBuilder -> uriBuilder.path("/oa/message")
+                                        .queryParam("access_token", accessToken)
+                                        .queryParam("user_id", userId) // Assuming user_id can be used here
+                                        .queryParam("offset", 0)
+                                        .queryParam("count", 50)
+                                        .build())
+                                .retrieve()
+                                .bodyToMono(String.class)
+                                .flatMap(messageResponse -> {
+                                    try {
+                                        JsonObject messageJsonResponse = JsonParser.parseString(messageResponse).getAsJsonObject();
+                                        if (messageJsonResponse.has("data") && messageJsonResponse.get("data").isJsonArray()) {
+                                            return Flux.fromIterable(messageJsonResponse.get("data").getAsJsonArray())
+                                                    .flatMap(messageElement -> {
+                                                        if (messageElement.isJsonObject()) {
+                                                            JsonObject message = messageElement.getAsJsonObject();
+                                                            if (message.has("message") && message.get("message").isJsonObject() &&
+                                                                    message.get("message").getAsJsonObject().has("text") &&
+                                                                    !message.get("message").getAsJsonObject().get("text").isJsonNull()) {
+                                                                String messageText = message.get("message").getAsJsonObject().get("text").getAsString();
+                                                                String senderId = message.has("from_id") && !message.get("from_id").isJsonNull() ? message.get("from_id").getAsString() : "unknown";
+                                                                logger.info("Processing message from {}: {}", senderId, messageText);
+                                                                return processIncomingZaloMessage(senderId, messageText);
+                                                            }
+                                                        }
+                                                        return Mono.empty();
+                                                    })
+                                                    .then(Mono.just("Processed messages for user " + userId));
+                                        }
+                                        return Mono.just("No messages found for user " + userId);
+                                    } catch (JsonSyntaxException e) {
+                                        logger.error("Error parsing Zalo API message response for user {}: {}", userId, e.getMessage());
+                                        return Mono.just("Error parsing Zalo API message response");
+                                    }
+                                })
+                                .onErrorResume(e -> {
+                                    logger.error("Error fetching messages for user {}: {}", userId, e.getMessage());
+                                    return Mono.just("Error fetching messages");
+                                });
+                    })
+                    .collectList()
+                    .map(results -> "Successfully processed Zalo API messages for specified users.");
+        } else {
+            // Existing logic for all conversations
+            return webClient.get()
+                    .uri(uriBuilder -> uriBuilder.path("/oa/latestmsg")
+                            .queryParam("access_token", accessToken)
+                            .queryParam("offset", 0)
+                            .queryParam("count", 50)
+                            .build())
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .flatMap(response -> {
+                        try {
+                            JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
+                            List<String> conversationIds = new CopyOnWriteArrayList<>();
+                            if (jsonResponse.has("data") && jsonResponse.get("data").isJsonArray()) {
+                                jsonResponse.get("data").getAsJsonArray().forEach(element -> {
+                                    if (element.isJsonObject()) {
+                                        JsonObject conversation = element.getAsJsonObject();
+                                        if (conversation.has("conversation_id") && !conversation.get("conversation_id").isJsonNull()) {
+                                            String conversationId = conversation.get("conversation_id").getAsString();
+                                            logger.info("Extracted Conversation ID: {}", conversationId);
+                                            conversationIds.add(conversationId);
+                                        }
+                                    }
+                                });
+                            }
+
+                            // Now iterate through conversation IDs and fetch messages for each
+                            return Flux.fromIterable(conversationIds)
+                                    .flatMap(conversationId -> {
+                                        logger.info("Fetching messages for conversation ID: {}", conversationId);
+                                        // Assuming the endpoint for getting messages in a conversation is /oa/message
+                                        return webClient.get()
+                                                .uri(uriBuilder -> uriBuilder.path("/oa/message")
+                                                        .queryParam("access_token", accessToken)
+                                                        .queryParam("conversation_id", conversationId)
+                                                        .queryParam("offset", 0)
+                                                        .queryParam("count", 50)
+                                                        .build())
+                                                .retrieve()
+                                                .bodyToMono(String.class)
+                                                .flatMap(messageResponse -> {
+                                                    try {
+                                                        JsonObject messageJsonResponse = JsonParser.parseString(messageResponse).getAsJsonObject();
+                                                        if (messageJsonResponse.has("data") && messageJsonResponse.get("data").isJsonArray()) {
+                                                            return Flux.fromIterable(messageJsonResponse.get("data").getAsJsonArray())
+                                                                    .flatMap(messageElement -> {
+                                                                        if (messageElement.isJsonObject()) {
+                                                                            JsonObject message = messageElement.getAsJsonObject();
+                                                                            if (message.has("message") && message.get("message").isJsonObject() &&
+                                                                                    message.get("message").getAsJsonObject().has("text") &&
+                                                                                    !message.get("message").getAsJsonObject().get("text").isJsonNull()) {
+                                                                                String messageText = message.get("message").getAsJsonObject().get("text").getAsString();
+                                                                                String senderId = message.has("from_id") && !message.get("from_id").isJsonNull() ? message.get("from_id").getAsString() : "unknown";
+                                                                                logger.info("Processing message from {}: {}", senderId, messageText);
+                                                                                return processIncomingZaloMessage(senderId, messageText);
+                                                                            }
+                                                                        }
+                                                                        return Mono.empty();
+                                                                    })
+                                                                    .then(Mono.just("Processed messages for conversation " + conversationId));
+                                                        }
+                                                        return Mono.just("No messages found for conversation " + conversationId);
+                                                    } catch (JsonSyntaxException e) {
+                                                        logger.error("Error parsing Zalo API message response for conversation {}: {}", conversationId, e.getMessage());
+                                                        return Mono.just("Error parsing Zalo API message response");
+                                                    }
+                                                })
+                                                .onErrorResume(e -> {
+                                                    logger.error("Error fetching messages for conversation {}: {}", conversationId, e.getMessage());
+                                                    return Mono.just("Error fetching messages");
+                                                });
+                                    })
+                                    .collectList()
+                                    .map(results -> "Successfully processed Zalo API latest messages and fetched individual conversation messages.");
+
+                        } catch (JsonSyntaxException e) {
+                            logger.error("Error parsing Zalo API latest messages response: {}", e.getMessage());
+                            return Mono.just("Error parsing Zalo API response: " + e.getMessage());
+                        }
+                    })
+                    .onErrorResume(e -> {
+                        logger.error("Error calling Zalo API to read messages: {}", e.getMessage());
+                        return Mono.just("Error calling Zalo API: " + e.getMessage());
+                    });
+        }
     }
 
     private void triggerUserConfirmationFlow(String senderId, String unresolvedName, String originalMessage) {

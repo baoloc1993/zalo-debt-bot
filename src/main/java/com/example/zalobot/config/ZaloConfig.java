@@ -11,10 +11,24 @@ public class ZaloConfig {
     private String appId;
     @Value("${zalo.app.secret}")
     private String appSecret;
-    @Value("${zalo.access.token}")
     private String accessToken;
-    @Value("${zalo.refresh.token}")
     private String refreshToken;
     @Value("${zalo.redirect.uri}")
     private String redirectUri;
+
+    public String getAccessToken() {
+        return accessToken;
+    }
+
+    public void setAccessToken(String accessToken) {
+        this.accessToken = accessToken;
+    }
+
+    public String getRefreshToken() {
+        return refreshToken;
+    }
+
+    public void setRefreshToken(String refreshToken) {
+        this.refreshToken = refreshToken;
+    }
 }
