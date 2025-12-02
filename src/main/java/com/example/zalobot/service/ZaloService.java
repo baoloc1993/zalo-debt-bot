@@ -30,6 +30,8 @@ import com.example.zalobot.config.ZaloConfig;
 import com.example.zalobot.service.GeminiApiClient;
 import com.example.zalobot.service.ZaloTokenService;
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
@@ -47,6 +49,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Flux;
 import org.springframework.beans.factory.annotation.Value;
+import java.util.Arrays;
 
 @Service
 public class ZaloService {
@@ -65,6 +68,71 @@ public class ZaloService {
     private final ZaloTokenService zaloTokenService;
     private final Gson gson = new Gson();
 
+    private final Map<String, List<GeminiMessage>> conversationHistories = new ConcurrentHashMap<>();
+
+    public List<GeminiMessage> getConversationHistory(String senderId) {
+        return conversationHistories.computeIfAbsent(senderId, k -> new CopyOnWriteArrayList<>());
+    }
+
+
+    @Transactional
+    public Mono<Void> processIncomingZaloMessage(String senderId, String messageContent, String messageId) {
+        logger.info("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageContent);
+
+        // Save incoming message
+        ZaloMessage zaloMessage = new ZaloMessage();
+        zaloMessage.setSenderId(senderId);
+        zaloMessage.setReceiverId(zaloConfig.getOaId()); // Assuming the bot is the receiver
+        zaloMessage.setMessageContent(messageContent);
+        zaloMessage.setMessageType("text");
+        zaloMessage.setTimestamp(LocalDateTime.now());
+        zaloMessage.setDirection(ZaloMessage.Direction.inbound);
+        zaloMessage.setZaloMessageId(messageId);
+        zaloMessageRepository.save(zaloMessage);
+
+        // Check for pending confirmations first
+        return Mono.justOrEmpty(pendingUserConfirmationRepository.findByZaloUserIdAndConfirmationType(senderId, PendingUserConfirmation.ConfirmationType.PENDING))
+                .flatMap(pendingConfirmation -> handleConfirmationResponse(senderId, messageContent, pendingConfirmation))
+                .switchIfEmpty(Mono.defer(() -> {
+                    // If no pending confirmation, analyze the message
+                    return geminiApiClient.analyzeMessageForDebt(messageContent)
+                            .flatMap(analysisResult -> saveTransactionAnalysisResult(analysisResult, senderId, messageContent, messageId))
+                            .then();
+                }))
+                .then();
+    }
+
+    @Transactional
+    public Mono<Void> handleConfirmationResponse(String senderId, String userResponse, PendingUserConfirmation pendingConfirmation) {
+        if ("có".equalsIgnoreCase(userResponse)) {
+            // User confirmed, create new AppUser
+            AppUser newAppUser = new AppUser();
+            newAppUser.setName(pendingConfirmation.getProposedAppUserName());
+            // Assuming Zalo ID is not available for the new user yet, or might be the sender's ID if that's the logic.
+            // For now, let's leave it null or set a placeholder.
+            newAppUser.setZaloId(null); // Or some other logic to determine Zalo ID
+
+            return Mono.fromCallable(() -> appUserRepository.save(newAppUser))
+                    .flatMap(savedUser -> {
+                        // Now that the user is created, re-process the original message
+                        TransactionAnalysisResult analysisResult = gson.fromJson(pendingConfirmation.getAnalysisResultJson(), TransactionAnalysisResult.class);
+                        return saveTransactionAnalysisResult(analysisResult, senderId, pendingConfirmation.getOriginalMessageContent(), analysisResult.getZaloMessageId());
+                    })
+                    .doOnSuccess(v -> {
+                        pendingUserConfirmationRepository.delete(pendingConfirmation);
+                        sendMessage(senderId, "Đã tạo người dùng mới và ghi nhận giao dịch.");
+                    }).then();
+        } else if ("không".equalsIgnoreCase(userResponse)) {
+            // User declined, delete the pending confirmation
+            return Mono.fromRunnable(() -> pendingUserConfirmationRepository.delete(pendingConfirmation))
+                    .doOnSuccess(v -> sendMessage(senderId, "Đã hủy thao tác. Giao dịch không được ghi nhận."))
+                    .then();
+        } else {
+            // Unrecognized response, ask again
+            return sendMessage(senderId, "Vui lòng trả lời 'Có' hoặc 'Không'.").then();
+        }
+    }
+
     public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository, ZaloTokenService zaloTokenService) {
         this.zaloConfig = zaloConfig;
         this.webClient = webClientBuilder.baseUrl("https://openapi.zalo.me/v2.0").build();
@@ -81,6 +149,83 @@ public class ZaloService {
 
     public ZaloConfig getZaloConfig() {
         return zaloConfig;
+    }
+
+    public Mono<String> sendMessage(String userId, String message) {
+        return getValidAccessToken()
+                .flatMap(accessToken -> {
+                    JsonObject recipient = new JsonObject();
+                    recipient.addProperty("user_id", userId);
+
+                    JsonObject messageObject = new JsonObject();
+                    messageObject.addProperty("text", message);
+
+                    JsonObject data = new JsonObject();
+                    data.add("recipient", recipient);
+                    data.add("message", messageObject);
+
+                    return webClient.post()
+                            .uri("/oa/message")
+                            .header("Content-Type", "application/json")
+                            .header("access_token", accessToken)
+                            .bodyValue(data.toString())
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .doOnSuccess(response -> logger.info("Successfully sent message to user {}: {}. Response: {}", userId, message, response))
+                            .doOnError(error -> logger.error("Failed to send message to user {}: {}. Error: {}", userId, message, error.getMessage()));
+                });
+    }
+
+    public Mono<String> getProfile(String userId) {
+        return getValidAccessToken()
+                .flatMap(accessToken -> {
+                    JsonObject data = new JsonObject();
+                    data.addProperty("user_id", userId);
+                    String dataJsonString = data.toString();
+                    String encodedDataJsonString = java.net.URLEncoder.encode(dataJsonString, java.nio.charset.StandardCharsets.UTF_8);
+                    String fullUriString = "https://openapi.zalo.me/v2.0" + "/oa/get_profile?data=" + encodedDataJsonString;
+                    logger.info("ZaloService - Constructed profile URI string: {}", fullUriString);
+                    try {
+                        URI uri = new URI(fullUriString);
+                        return webClient.get()
+                                .uri(uri)
+                                .header("access_token", accessToken)
+                                .retrieve()
+                                .bodyToMono(String.class);
+                    } catch (URISyntaxException e) {
+                        logger.error("Error creating URI: {}", e.getMessage());
+                        return Mono.error(new RuntimeException("Invalid URI", e));
+                    }
+                });
+    }
+
+    public Mono<ZaloToken> exchangeCodeForAccessToken(String oauthCode) {
+        logger.info("Exchanging OAuth code for access token...");
+        String requestBody = "app_id=" + zaloConfig.getAppId() +
+                "&code=" + oauthCode +
+                "&grant_type=authorization_code";
+
+        return WebClient.builder().baseUrl("https://oauth.zalo.me/v4").build().post()
+                .uri("/access_token")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("secret_key", zaloConfig.getAppSecret())
+                .bodyValue(requestBody)
+                .retrieve()
+                .bodyToMono(String.class)
+                .flatMap(response -> {
+                    try {
+                        JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
+                        String accessToken = jsonResponse.get("access_token").getAsString();
+                        String refreshToken = jsonResponse.get("refresh_token").getAsString();
+                        Long expiresIn = jsonResponse.get("expires_in").getAsLong();
+                        ZaloToken savedToken = zaloTokenService.saveToken(accessToken, refreshToken, expiresIn);
+                        return Mono.just(savedToken);
+                    } catch (Exception e) {
+                        logger.error("Failed to parse Zalo token exchange response. Response: {}, Error: {}", response, e.getMessage());
+                        return Mono.error(new RuntimeException("Failed to parse Zalo token exchange response.", e));
+                    }
+                })
+                .doOnError(error -> logger.error("Error exchanging OAuth code for access token: {}", error.getMessage()));
     }
 
 
@@ -200,83 +345,205 @@ public class ZaloService {
                 });
     }
 
-    public Mono<TransactionAnalysisResult> analyzeMessageForDebt(String messageContent) {
-        List<GeminiMessage> prompt = List.of(
-                new GeminiMessage("user", List.of(new GeminiMessage.Part("Bạn là một trợ lý phân tích tin nhắn. Hãy kiểm tra xem tin nhắn sau có đề cập đến giao dịch nợ hoặc thanh toán hay không, hoặc có yêu cầu tổng hợp nợ/thanh toán hay không. Nếu có giao dịch, hãy trích xuất các thông tin sau: tên người liên quan (người nợ hoặc người trả), số tiền giao dịch, lý do giao dịch, và ngày giao dịch (nếu có). Đồng thời, xác định hướng của khoản nợ: nếu người dùng hiện tại nợ người khác, hãy đặt 'debt_direction' là 'USER_OWES_OTHER'; nếu người khác nợ người dùng hiện tại, hãy đặt 'debt_direction' là 'OTHER_OWES_USER'. Nếu có yêu cầu tổng hợp, hãy xác định loại tổng hợp (nợ, thanh toán, hoặc tất cả). Trả về kết quả dưới dạng JSON với các trường: 'is_transaction_related' (boolean), 'transaction_type' (string, 'debt' hoặc 'payment'), 'debt_direction' (string, 'USER_OWES_OTHER' hoặc 'OTHER_OWES_USER'), 'app_user_id' (long, ID của người dùng trong hệ thống, nếu có), 'app_user_name' (string, tên người dùng), 'amount' (number), 'reason' (string), 'transaction_date' (string, định dạng YYYY-MM-DD), 'is_summary_request' (boolean), 'summary_type' (string, 'debt', 'payment', 'all'). Nếu không có thông tin, hãy để giá trị là null hoặc chuỗi rỗng. Ví dụ: Tin nhắn: 'Tôi nợ Lan 50k tiền ăn trưa.' -> {'is_transaction_related': true, 'transaction_type': 'debt', 'debt_direction': 'USER_OWES_OTHER', 'app_user_name': 'Lan', 'amount': 50000, 'reason': 'tiền ăn trưa', 'transaction_date': null, 'is_summary_request': false, 'summary_type': null}. Tin nhắn: 'Lan nợ tôi 50k tiền ăn trưa.' -> {'is_transaction_related': true, 'transaction_type': 'debt', 'debt_direction': 'OTHER_OWES_USER', 'app_user_name': 'Lan', 'amount': 50000, 'reason': 'tiền ăn trưa', 'transaction_date': null, 'is_summary_request': false, 'summary_type': null}. Tin nhắn: " + messageContent))));
-        return geminiApiClient.generateContent(prompt)
-                .map(geminiResponse -> {
-                    String cleanedResponse = geminiResponse.replace("```json", "").replace("```", "").trim();
+
+    @Transactional
+    public Mono<Void> saveTransactionAnalysisResult(TransactionAnalysisResult analysisResult, String zaloUserId, String messageContent, String zaloMessageId) {
+        logger.info("Attempting to save transaction analysis result for user {}: {}", zaloUserId, analysisResult);
+        if (!analysisResult.isTransactionRelated()) {
+            return Mono.empty();
+        }
+
+        return Mono.justOrEmpty(appUserRepository.findByZaloId(zaloUserId))
+                .switchIfEmpty(Mono.defer(() -> {
+                    logger.info("AppUser not found for zaloId: {}, creating new AppUser.", zaloUserId);
+                    AppUser newAppUser = new AppUser();
+                    newAppUser.setZaloId(zaloUserId);
+                    newAppUser.setName("ZaloUser_" + zaloUserId); // Default name
+                    return Mono.just(appUserRepository.save(newAppUser));
+                }))
+                .flatMap(currentUser -> {
+                    String transactionType = analysisResult.getTransactionType();
+                    String debtDirection = analysisResult.getDebtDirection();
+                    String appUserName = analysisResult.getAppUserName();
+                    BigDecimal amount = analysisResult.getAmount() != null ? BigDecimal.valueOf(analysisResult.getAmount()) : null;
+                    String reason = analysisResult.getReason();
+                    LocalDate transactionDate = analysisResult.getTransactionDate() != null ? LocalDate.parse(analysisResult.getTransactionDate()) : null;
+
+                    if ("debt".equals(transactionType)) {
+                        return entityResolutionService.resolveAppUser(appUserName)
+                                .flatMap(otherUserOptional -> {
+                                    if (otherUserOptional.isPresent()) {
+                                        AppUser otherUser = otherUserOptional.get();
+                                        DebtRecord debtRecord = new DebtRecord();
+                                        debtRecord.setZaloMessageId(zaloMessageId);
+                                        debtRecord.setAmount(amount);
+                                        debtRecord.setReason(reason);
+                                        debtRecord.setDueDate(transactionDate);
+
+                                        if ("USER_OWES_OTHER".equals(debtDirection)) {
+                                            debtRecord.setDebtorUser(currentUser);
+                                            debtRecord.setCreditorUser(otherUser);
+                                        } else if ("OTHER_OWES_USER".equals(debtDirection)) {
+                                            debtRecord.setDebtorUser(otherUser);
+                                            debtRecord.setCreditorUser(currentUser);
+                                        } else {
+                                            return Mono.error(new RuntimeException("Invalid debt direction: " + debtDirection));
+                                        }
+                                        return Mono.fromCallable(() -> debtRecordRepository.save(debtRecord)).then();
+                                    } else {
+                                        // AppUser not found, send confirmation message
+                                        String confirmationMessage = String.format("Không tìm thấy người dùng '%s'. Bạn có muốn tạo người dùng mới với tên này không? (Có/Không)", appUserName);
+                                        return sendMessage(zaloUserId, confirmationMessage)
+                                                .flatMap(messageId -> {
+                                                    PendingUserConfirmation pendingConfirmation = new PendingUserConfirmation();
+                                                    pendingConfirmation.setZaloUserId(zaloUserId);
+                                                    pendingConfirmation.setOriginalMessageContent(messageContent);
+                                                    pendingConfirmation.setAnalysisResultJson(gson.toJson(analysisResult));
+                                                    pendingConfirmation.setConfirmationType(PendingUserConfirmation.ConfirmationType.CREATE_APP_USER);
+                                                    pendingConfirmation.setProposedAppUserName(appUserName);
+                                                    pendingConfirmation.setZaloMessageId(zaloMessageId); // Store original Zalo message ID
+                                                    return Mono.fromCallable(() -> pendingUserConfirmationRepository.save(pendingConfirmation)).then();
+                                                });
+                                    }
+                                });
+                    } else if ("payment".equals(transactionType)) {
+                        // For payments, we assume the current user is making/receiving the payment
+                        PaymentRecord paymentRecord = new PaymentRecord();
+                        paymentRecord.setZaloMessageId(zaloMessageId);
+                        paymentRecord.setAppUser(currentUser);
+                        paymentRecord.setAmount(amount);
+                        paymentRecord.setReason(reason);
+                        return Mono.fromCallable(() -> paymentRecordRepository.save(paymentRecord)).then();
+                    } else {
+                        logger.warn("Unknown transaction type: {}", transactionType);
+                        return Mono.empty();
+                    }
+                });
+    }
+
+
+
+    public Mono<TransactionAnalysisResult> analyzeMessageForDebt(String messageContent, String zaloMessageId) {
+        return geminiApiClient.analyzeMessageForDebt(messageContent)
+                .map(analysisResult -> {
+                    analysisResult.setZaloMessageId(zaloMessageId);
+                    return analysisResult;
+                });
+    }
+
+    @Transactional
+    public Mono<Void> handleConfirmationResponse(String zaloUserId, String confirmationResponse, String zaloMessageId) {
+        return Mono.fromCallable(() -> pendingUserConfirmationRepository.findByZaloUserIdAndZaloMessageId(zaloUserId, zaloMessageId))
+                .flatMap(optionalPendingConfirmation -> {
+                    if (optionalPendingConfirmation.isEmpty()) {
+                        logger.warn("No pending confirmation found for Zalo user {} with message ID {}", zaloUserId, zaloMessageId);
+                        return Mono.empty();
+                    }
+
+                    PendingUserConfirmation pendingConfirmation = optionalPendingConfirmation.get();
+                    pendingUserConfirmationRepository.delete(pendingConfirmation);
+
+                    if (confirmationResponse.equalsIgnoreCase("Có")) {
+                        logger.info("User {} confirmed creation of AppUser {}", zaloUserId, pendingConfirmation.getProposedAppUserName());
+                        AppUser newAppUser = new AppUser();
+                        newAppUser.setName(pendingConfirmation.getProposedAppUserName());
+                        return Mono.fromCallable(() -> appUserRepository.save(newAppUser))
+                                .flatMap(savedAppUser -> {
+                                    logger.info("New AppUser {} created. Re-processing original message.", savedAppUser.getName());
+                                    TransactionAnalysisResult analysisResult = gson.fromJson(pendingConfirmation.getAnalysisResultJson(), TransactionAnalysisResult.class);
+                                    return saveTransactionAnalysisResult(analysisResult, zaloUserId, pendingConfirmation.getOriginalMessageContent(), analysisResult.getZaloMessageId())
+                                            .then(sendMessage(zaloUserId, String.format("Đã tạo người dùng '%s' và xử lý giao dịch của bạn.", savedAppUser.getName())));
+                                });
+                    } else {
+                        logger.info("User {} declined creation of AppUser {}", zaloUserId, pendingConfirmation.getProposedAppUserName());
+                        return sendMessage(zaloUserId, String.format("Đã hủy tạo người dùng '%s'. Giao dịch không được xử lý.", pendingConfirmation.getProposedAppUserName()));
+                    }
+                })
+                .then();
+    }
+
+
+
+    public Flux<String> readMessages() {
+        logger.info("ZaloService - Starting readMessages process.");
+
+
+        List<String> userIds = Arrays.asList(zaloConfig.getScheduledUsers().split(","));
+
+        return Flux.fromIterable(userIds)
+                .flatMap(userId -> getAndAnalyzeLatestMessage(userId)
+                        .map(analysisResult -> "Processed message for user " + userId + ": " + analysisResult.getAnalysisJson()))
+                .doOnError(e -> logger.error("Error during message processing: {}", e.getMessage()))
+                .doOnComplete(() -> logger.info("Finished processing messages for all configured users."));
+    }
+
+    public Mono<TransactionAnalysisResult> getAndAnalyzeLatestMessage(String userId) {
+        return getConversation(userId, 0, 1)
+                .flatMap(response -> {
                     try {
-                        JsonObject jsonResponse = JsonParser.parseString(cleanedResponse).getAsJsonObject();
-                        boolean isTransactionRelated = jsonResponse.has("is_transaction_related") && jsonResponse.get("is_transaction_related").getAsBoolean();
-                        String transactionType = jsonResponse.has("transaction_type") && !jsonResponse.get("transaction_type").isJsonNull() ? jsonResponse.get("transaction_type").getAsString() : null;
-                        String debtDirection = jsonResponse.has("debt_direction") && !jsonResponse.get("debt_direction").isJsonNull() ? jsonResponse.get("debt_direction").getAsString() : null;
-                        boolean isSummaryRequest = jsonResponse.has("is_summary_request") && jsonResponse.get("is_summary_request").getAsBoolean();
-                        String summaryType = jsonResponse.has("summary_type") && !jsonResponse.get("summary_type").isJsonNull() ? jsonResponse.get("summary_type").getAsString() : null;
-                        return new TransactionAnalysisResult(transactionType, debtDirection, isTransactionRelated, isSummaryRequest, summaryType, cleanedResponse);
+                        JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
+                        JsonArray dataArray = jsonResponse.getAsJsonArray("data");
+                        if (dataArray != null && dataArray.size() > 0) {
+                            JsonObject latestMessage = dataArray.get(0).getAsJsonObject();
+                            String messageContent = latestMessage.get("message").getAsString();
+                            String messageId = latestMessage.get("msg_id").getAsString();
+                            logger.info("Extracted latest message for user {}: {}", userId, messageContent);
+                            return analyzeMessageForDebt(messageContent, messageId)
+                                .flatMap(analysisResult -> {
+                                    if (analysisResult.isTransactionRelated()) {
+                                        return saveTransactionAnalysisResult(analysisResult, userId, messageContent, messageId)
+                                                .thenReturn(analysisResult);
+                                    } else {
+                                        return Mono.just(analysisResult);
+                                    }
+                                });
+                        } else {
+                            logger.info("No messages found for user {}", userId);
+                            return Mono.empty();
+                        }
                     } catch (Exception e) {
-                        logger.error("Error parsing Gemini transaction analysis response: {}", e.getMessage());
-                        return new TransactionAnalysisResult(null, null, false, false, null, "{}");
+                        logger.error("Error parsing conversation response for user {}: {}", userId, e.getMessage());
+                        return Mono.error(new RuntimeException("Failed to parse conversation response", e));
                     }
                 });
     }
 
     @Transactional
-    public Mono<TransactionAnalysisResult> processIncomingZaloMessage(String senderId, String messageText) {
-        logger.info("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageText);
-
-        // Ensure sender AppUser exists
-        AppUser senderAppUser = appUserRepository.findByZaloId(senderId).orElseGet(() -> {
-            AppUser newSenderAppUser = new AppUser();
-            newSenderAppUser.setZaloId(senderId);
-            newSenderAppUser.setName(senderId); // Default name to senderId, can be updated later
-            return appUserRepository.save(newSenderAppUser);
-        });
-        logger.info("Sender AppUser ID: {} for Zalo ID: {}", senderAppUser.getId(), senderId);
-
-        Optional<PendingUserConfirmation> pendingConfirmation = pendingUserConfirmationRepository
-                .findBySenderIdAndStatus(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
-
-        if (pendingConfirmation.isPresent()) {
-            handleConfirmationResponse(senderId, messageText);
+    public Mono<Void> remindUsersWithUnpaidDebts() {
+        String userIdsString = zaloConfig.getScheduledUsers();
+        if (userIdsString == null || userIdsString.isEmpty()) {
+            logger.info("No scheduled users to remind.");
             return Mono.empty();
         }
-        return Mono.empty(); // Placeholder
-    }
+        List<String> userIds = Arrays.asList(zaloConfig.getScheduledUsers().split(","));
 
-    private List<GeminiMessage> getConversationHistory(String senderId) {
-        // Placeholder for conversation history retrieval
-        return new CopyOnWriteArrayList<>();
-    }
-
-    public Mono<Void> readMessages(List<String> userIds) {
         return Flux.fromIterable(userIds)
-                .flatMap(userId -> getConversation(userId, 0, 1) // Assuming default offset 0 and count 1
-                        .doOnNext(response -> logger.info("Read messages for user {}: {}", userId, response))
-                        .onErrorResume(e -> {
-                            logger.error("Error reading messages for user {}: {}", userId, e.getMessage());
-                            return Mono.empty();
-                        }))
+                .flatMap(userId -> {
+                    // Similar to processIncomingZaloMessage, but initiated by the system
+                    String messageContent = "Nhắc nợ"; // Example message
+                    String messageId = UUID.randomUUID().toString();
+
+                    ZaloMessage reminderMessage = new ZaloMessage();
+                    reminderMessage.setSenderId(zaloConfig.getOaId());
+                    reminderMessage.setReceiverId(userId);
+                    reminderMessage.setMessageContent(messageContent);
+                    reminderMessage.setMessageType("text");
+                    reminderMessage.setTimestamp(LocalDateTime.now());
+                    reminderMessage.setDirection(ZaloMessage.Direction.outbound);
+                    reminderMessage.setZaloMessageId(messageId);
+                    zaloMessageRepository.save(reminderMessage);
+
+                    return Mono.justOrEmpty(pendingUserConfirmationRepository.findByZaloUserIdAndConfirmationType(userId, PendingUserConfirmation.ConfirmationType.PENDING))
+                            .flatMap(pendingConfirmation -> handleConfirmationResponse(userId, "có", pendingConfirmation)) // Auto-confirm for reminders
+                            .switchIfEmpty(Mono.defer(() ->
+                                    geminiApiClient.analyzeMessageForDebt(messageContent)
+                                        .flatMap(analysisResult ->
+                                            saveTransactionAnalysisResult(analysisResult, userId, messageContent, messageId))
+                                        .then()
+                            ));
+                })
                 .then();
     }
 
-    public Mono<String> handleConfirmationResponse(String senderId, String response) {
-        // Placeholder for handleConfirmationResponse
-        return Mono.just("Handling confirmation response for user " + senderId);
-    }
 
-    public Mono<String> getProfile(String userId) {
-        // Placeholder for getProfile
-        return Mono.just("Getting profile for user " + userId);
     }
-
-    public Mono<String> sendMessage(String userId, String message) {
-        // Placeholder for sendMessage
-        return Mono.just("Sending message to user " + userId);
-    }
-
-    public Mono<String> exchangeCodeForAccessToken(String code) {
-        // Placeholder for exchangeCodeForAccessToken
-        return Mono.just("Exchanging code for access token");
-    }
-}

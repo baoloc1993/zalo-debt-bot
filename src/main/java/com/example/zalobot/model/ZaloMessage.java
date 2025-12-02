@@ -35,6 +35,45 @@ public class ZaloMessage {
     @Column(name = "raw_data", columnDefinition = "JSON")
     private String rawData;
 
+    @Column(name = "zalo_message_id", unique = true)
+    private String zaloMessageId;
+
+    public String getZaloMessageId() {
+        return zaloMessageId;
+    }
+
+    public void setZaloMessageId(String zaloMessageId) {
+        this.zaloMessageId = zaloMessageId;
+    }
+
+    public void setRawData(String rawData) {
+        this.rawData = rawData;
+    }
+
+    public void setSenderId(String senderId) {
+        this.senderId = senderId;
+    }
+
+    public void setReceiverId(String receiverId) {
+        this.receiverId = receiverId;
+    }
+
+    public void setMessageContent(String messageContent) {
+        this.messageContent = messageContent;
+    }
+
+    public void setMessageType(String messageType) {
+        this.messageType = messageType;
+    }
+
+    public void setTimestamp(LocalDateTime timestamp) {
+        this.timestamp = timestamp;
+    }
+
+    public void setDirection(Direction direction) {
+        this.direction = direction;
+    }
+
     public enum Direction {
         inbound,
         outbound

@@ -14,4 +14,49 @@ public class TransactionAnalysisResult {
     private boolean isSummaryRequest;
     private String summaryType;
     private String analysisJson;
+    private String transactionDate;
+    private Double amount;
+    private String reason;
+    private String appUserName;
+    private String zaloMessageId;
+
+    public boolean isTransactionRelated() {
+        return isTransactionRelated;
+    }
+
+    public String getAnalysisJson() {
+        return analysisJson;
+    }
+
+    public String getZaloMessageId() {
+        return zaloMessageId;
+    }
+
+    public void setZaloMessageId(String zaloMessageId) {
+        this.zaloMessageId = zaloMessageId;
+    }
+
+    public String getTransactionType() {
+        return transactionType;
+    }
+
+    public String getDebtDirection() {
+        return debtDirection;
+    }
+
+    public String getAppUserName() {
+        return appUserName;
+    }
+
+    public Double getAmount() {
+        return amount;
+    }
+
+    public String getReason() {
+        return reason;
+    }
+
+    public String getTransactionDate() {
+        return transactionDate;
+    }
 }

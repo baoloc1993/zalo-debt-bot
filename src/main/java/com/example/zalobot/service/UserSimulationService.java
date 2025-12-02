@@ -19,13 +19,9 @@ public class UserSimulationService {
     public Mono<Void> simulateIncomingMessage(String senderId, String messageText) {
         logger.debug("SIMULATION: User {} sends message: {}", senderId, messageText);
         System.out.println("SYSTEM_OUT_SIMULATION: User " + senderId + " sends message: " + messageText);
-        return zaloService.processIncomingZaloMessage(senderId, messageText)
+                return zaloService.processIncomingZaloMessage(senderId, messageText, "simulated_message_id")
                 .then(Mono.empty()); // Ensure subscription and return Mono<Void>
     }
 
-    public Mono<Void> simulateConfirmationResponse(String senderId, String response) {
-        System.out.println("SIMULATION: User " + senderId + " responds to confirmation: " + response);
-        zaloService.handleConfirmationResponse(senderId, response);
-        return Mono.empty();
-    }
+
 }

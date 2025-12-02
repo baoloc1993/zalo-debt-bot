@@ -12,7 +12,6 @@ import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "debt_records")
-@Data
 @NoArgsConstructor
 @AllArgsConstructor
 public class DebtRecord {
@@ -21,7 +20,7 @@ public class DebtRecord {
     private Long id;
 
     @Column(name = "zalo_message_id")
-    private Long zaloMessageId; // Liên kết với tin nhắn Zalo gốc
+    private String zaloMessageId; // Liên kết với tin nhắn Zalo gốc
 
     @ToString.Exclude
     @ManyToOne
@@ -48,5 +47,70 @@ public class DebtRecord {
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();
+    }
+
+    // Getters and Setters
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getZaloMessageId() {
+        return zaloMessageId;
+    }
+
+    public void setZaloMessageId(String zaloMessageId) {
+        this.zaloMessageId = zaloMessageId;
+    }
+
+    public AppUser getDebtorUser() {
+        return debtorUser;
+    }
+
+    public void setDebtorUser(AppUser debtorUser) {
+        this.debtorUser = debtorUser;
+    }
+
+    public AppUser getCreditorUser() {
+        return creditorUser;
+    }
+
+    public void setCreditorUser(AppUser creditorUser) {
+        this.creditorUser = creditorUser;
+    }
+
+    public BigDecimal getAmount() {
+        return amount;
+    }
+
+    public void setAmount(BigDecimal amount) {
+        this.amount = amount;
+    }
+
+    public String getReason() {
+        return reason;
+    }
+
+    public void setReason(String reason) {
+        this.reason = reason;
+    }
+
+    public LocalDate getDueDate() {
+        return dueDate;
+    }
+
+    public void setDueDate(LocalDate dueDate) {
+        this.dueDate = dueDate;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
     }
 }

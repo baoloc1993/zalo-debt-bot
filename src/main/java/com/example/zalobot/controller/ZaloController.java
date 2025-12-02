@@ -70,39 +70,16 @@ public class ZaloController {
                     logger.debug("Payload parsed successfully. Event name: {}", event.getEventName());
                     String senderId = event.getSenderId();
                     String messageText = event.getMessage() != null ? event.getMessage().getText() : "";
-                    logger.info("Received Zalo message from senderId: {} with text: {}", senderId, messageText);
+                    String zaloMessageId = event.getMessage() != null ? event.getMessage().getMsgId() : null;
+                    logger.info("Received Zalo message from senderId: {} with text: {} and msgId: {}", senderId, messageText, zaloMessageId);
 
                     if (messageText.isEmpty()) {
-                        logger.warn("Received empty message from senderId: {}. Skipping Gemini processing.", senderId);
+                        logger.warn("Received empty message from senderId: {}. Skipping processing.", senderId);
                         return Mono.just("ok");
                     }
 
-                    logger.debug("Processing incoming Zalo message for debt analysis.");
-                    return zaloService.processIncomingZaloMessage(senderId, messageText)
-                            .flatMap(debtAnalysisResult -> {
-                                logger.info("Debt analysis result for senderId {}: isTransactionRelated={}, rawData={}", senderId, debtAnalysisResult.isTransactionRelated(), debtAnalysisResult.getAnalysisJson());
-                                if (debtAnalysisResult.isTransactionRelated()) {
-                                    String debtResponse = "Tin nhắn này có vẻ liên quan đến việc nợ tiền. Tôi đã ghi nhận thông tin chi tiết.";
-                                    return zaloService.sendMessage(senderId, debtResponse)
-                                            .doOnSuccess(response -> logger.info("Successfully sent debt-related message to Zalo: {}", response))
-                                            .doOnError(e -> logger.error("Error sending debt-related message to Zalo for senderId: {}: {}", senderId, e.getMessage()))
-                                            .thenReturn("ok");
-                                } else {
-                                    logger.debug("Message not debt-related. Sending to Gemini API for general command.");
-                                    return zaloService.handleGeminiCommand(senderId, messageText)
-                                            .flatMap(geminiResponse -> {
-                                                logger.info("Received response from Gemini for general command: {}", geminiResponse);
-                                                logger.debug("Sending Gemini response back to Zalo senderId: {}", senderId);
-                                                return zaloService.sendMessage(senderId, geminiResponse)
-                                                        .doOnSuccess(response -> logger.info("Successfully sent message to Zalo: {}", response))
-                                                        .doOnError(e -> logger.error("Error sending message to Zalo for senderId: {}: {}", senderId, e.getMessage()))
-                                                        .thenReturn("ok");
-                                            })
-                                            .doOnError(e -> logger.error("Error during general Gemini API call for senderId: {}: {}", senderId, e.getMessage()))
-                                            .thenReturn("ok");
-                                }
-                            })
-                            .doOnError(e -> logger.error("Error during processing incoming Zalo message for senderId: {}: {}", senderId, e.getMessage()))
+                    logger.debug("Processing incoming Zalo message.");
+                    return zaloService.processIncomingZaloMessage(senderId, messageText, zaloMessageId)
                             .thenReturn("ok");
                 })
                 .onErrorResume(e -> {

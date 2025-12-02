@@ -28,4 +28,36 @@ public class AppUser {
     @ToString.Exclude
     @OneToMany(mappedBy = "appUser", cascade = CascadeType.ALL, orphanRemoval = true)
     private Set<UserAlias> aliases = new HashSet<>();
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getZaloId() {
+        return zaloId;
+    }
+
+    public void setZaloId(String zaloId) {
+        this.zaloId = zaloId;
+    }
+
+    public Set<UserAlias> getAliases() {
+        return aliases;
+    }
+
+    public void setAliases(Set<UserAlias> aliases) {
+        this.aliases = aliases;
+    }
 }

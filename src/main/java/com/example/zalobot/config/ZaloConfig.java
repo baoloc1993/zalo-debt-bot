@@ -15,6 +15,25 @@ public class ZaloConfig {
     @Value("${zalo.app.secret}")
     private String appSecret;
 
+    @Value("${zalo.oa.id}")
+    private String oaId;
 
+    @Value("${zalo.scheduled.users:}")
+    private String scheduledUsers;
 
+    public String getAppId() {
+        return appId;
+    }
+
+    public String getAppSecret() {
+        return appSecret;
+    }
+
+    public String getOaId() {
+        return oaId;
+    }
+
+    public String getScheduledUsers() {
+        return scheduledUsers;
+    }
 }

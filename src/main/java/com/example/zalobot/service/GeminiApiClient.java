@@ -29,6 +29,12 @@ public class GeminiApiClient {
         this.geminiApiUrl = geminiApiUrl;
     }
 
+    public Mono<com.example.zalobot.model.TransactionAnalysisResult> analyzeMessageForDebt(String message) {
+        // This is a placeholder implementation.
+        // In a real application, you would call the Gemini API here.
+        return Mono.just(new com.example.zalobot.model.TransactionAnalysisResult());
+    }
+
     public Mono<String> generateContent(List<GeminiMessage> messages) {
         GeminiRequest requestBody = new GeminiRequest(messages);
 

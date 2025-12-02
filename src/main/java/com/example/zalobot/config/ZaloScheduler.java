@@ -37,6 +37,6 @@ public class ZaloScheduler {
                                    .filter(s -> !s.isEmpty())
                                    .collect(Collectors.toList());
          }
-         zaloService.readMessages(targetUserIds).subscribe();
+         zaloService.readMessages().subscribe();
     }
 }

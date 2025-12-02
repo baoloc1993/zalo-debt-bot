@@ -42,11 +42,7 @@ public class UserSimulationController {
                 .thenReturn("Simulation of incoming message sent successfully.");
     }
 
-    @PostMapping("/confirmation")
-    public Mono<String> simulateConfirmation(@RequestParam String senderId, @RequestParam String response) {
-        return userSimulationService.simulateConfirmationResponse(senderId, response)
-                .thenReturn("Simulation of confirmation response sent successfully.");
-    }
+
 
     @PostMapping("/clear-db")
     public Mono<String> clearDatabase() {
