@@ -30,9 +30,6 @@ public class ZaloScheduler {
     @Scheduled(fixedRate = 60000) // Schedule to run every 60 seconds
     public void readMessages() {
          logger.info("Scheduled task: Reading Zalo messages...");
-         logger.debug("ZaloScheduler - Refresh token before calling refreshAccessToken: {}", zaloService.getZaloConfig().getRefreshToken() != null ? zaloService.getZaloConfig().getRefreshToken().substring(0, Math.min(zaloService.getZaloConfig().getRefreshToken().length(), 10)) + "..." : "null");
-         logger.debug("ZaloScheduler - Calling zaloService.refreshAccessToken().block()");
-         zaloService.refreshAccessToken().block(); // Ensure token is refreshed before reading messages
          List<String> targetUserIds = null;
          if (scheduledUsersString != null && !scheduledUsersString.isEmpty()) {
              targetUserIds = Arrays.stream(scheduledUsersString.split(","))

@@ -25,6 +25,11 @@ public class ZaloController {
         this.objectMapper = objectMapper;
     }
 
+    @GetMapping("/zalo/conversation")
+    public Mono<String> getConversation(@RequestParam String userId, @RequestParam(defaultValue = "0") int offset, @RequestParam(defaultValue = "10") int count) {
+        return zaloService.getConversation(userId, offset, count);
+    }
+
     @GetMapping("/zalo/profile")
     public Mono<String> getProfile(@RequestParam String userId) {
         return zaloService.getProfile(userId);
