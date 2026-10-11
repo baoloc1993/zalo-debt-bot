@@ -61,8 +61,8 @@ The reverse sentence (*"Lan nợ tôi 50k"*) yields `OTHER_OWES_USER`, which swa
 - **Confirmation state machine**: `PENDING` -> `CONFIRMED` / `DENIED` for unknown counterparties (`PendingUserConfirmation`, `ZaloService.handleConfirmationResponse`).
 - **Debt direction handling**: `USER_OWES_OTHER` / `OTHER_OWES_USER` decide debtor and creditor (`ZaloService.saveTransactionAnalysisResult`).
 - **Zalo OAuth v4 with automatic refresh**: tokens persisted in `zalo_tokens`, refreshed when expired (`ZaloService.getValidAccessToken`, `ZaloTokenService`).
-- **Scheduled polling**: every 60 s, reads the latest conversation message of configured users (`ZaloScheduler`).
-- **Message log**: every inbound message is stored (`ZaloMessage`).
+- **Scheduled polling**: every 60 s, reads the latest conversation message of configured users (`ZaloScheduler`); it feeds the same pipeline as the webhook, so nothing is processed twice.
+- **Idempotent message handling**: every inbound message is stored once, keyed by its Zalo message id (`ZaloMessage`, `InboundMessageRegistry`).
 - **Profile-gated dev tools**: `/simulate/*` exists only with the `dev` profile (`UserSimulationController`).
 - **Health endpoint**: Spring Actuator (`/actuator/health`).
 
@@ -101,7 +101,7 @@ sequenceDiagram
     U->>Z: "Tôi nợ Lan 50k tiền ăn trưa"
     Z->>C: POST /zalo/webhook
     C->>S: processIncomingZaloMessage(sender, text, msgId)
-    S->>DB: save ZaloMessage (inbound)
+    S->>DB: register message id (already seen: stop here)
     S->>DB: find PENDING confirmation for sender
     DB-->>S: none
     S->>G: analyzeMessageForDebt(text)
@@ -144,11 +144,22 @@ Outbound Zalo calls go through `getValidAccessToken()`: load the latest row of `
   in `pending_user_confirmations`, so the dialogue is not held in memory and survives restarts. While a `PENDING` row
   exists for a sender, their next message is interpreted as the answer (`Có/co/yes/y`, `Không/khong/no/n`, anything
   else re-asks) before any new analysis runs.
+- **Idempotent ingestion shared by webhook and poller.** `ZaloService.processIncomingZaloMessage` first registers the
+  message through `InboundMessageRegistry`: an `existsByZaloMessageId` check, then an insert guarded by the unique
+  `zalo_messages.zalo_message_id` column. A repeated webhook delivery, the next polling tick, or two racing deliveries
+  therefore yield exactly one record or question; the loser of an insert race gets a constraint violation that is
+  treated as "already processed". The poller feeds the same method (so it also honours pending confirmations) and
+  skips messages sent by the OA itself. A message that fails during processing is logged and is not retried, so a
+  poison message cannot loop. `ZaloScheduler` additionally skips a tick while the previous run is still in flight.
 - **Never record on a guess.** Unknown counterparties are never auto-created; the transaction is only saved after
   an explicit yes. An invalid debt direction fails the pipeline instead of storing swapped parties.
 - **Reactive HTTP clients, blocking persistence.** Outbound calls use WebFlux `WebClient` (`Mono`/`Flux`) while
-  persistence uses blocking Spring Data JPA calls. Failures to send a reply are isolated (`notifyUser` logs and
+  persistence uses blocking Spring Data JPA calls, which are moved off the HTTP event loop (`boundedElastic`) in the
+  poller and in `EntityResolutionService`. Failures to send a reply are isolated (`notifyUser` logs and
   swallows), so a Zalo outage does not undo a recorded transaction.
+- **No lazy entities escaping the persistence layer.** Alias lookup selects the owning `AppUser` directly
+  (`UserAliasRepository.findAppUsersByAlias`) instead of calling a lazy `getAppUser()` after the transaction ended;
+  a non-transactional H2 test pins this down.
 - **Token lifecycle.** OAuth tokens live in the database, the newest row wins, expiry is computed from
   `createdAt + expiresIn`, and refresh is transparent to callers.
 - **Secrets and config.** Every credential comes from an environment variable (`application.properties`,
@@ -160,9 +171,6 @@ Outbound Zalo calls go through `getValidAccessToken()`: load the latest row of `
 
 ## Trade-offs and known limitations
 
-- **Poller reprocesses messages.** `ZaloScheduler` fetches each configured user's latest message every 60 s and does
-  not remember which one it already handled, so the same message can be recorded repeatedly. The webhook is the
-  intended primary path; polling is a fallback that needs a processed-message-id check.
 - **No webhook authentication.** `POST /zalo/webhook` does not verify Zalo's signature, and the proxy endpoints
   (`/zalo/messages/send`, `/zalo/conversation`, `/zalo/profile`, `/zalo/gemini/command`) have no authentication.
   Fine for a local demo, not for exposure to the internet.
@@ -170,13 +178,16 @@ Outbound Zalo calls go through `getValidAccessToken()`: load the latest row of `
   (logged only); there is no retry and no reply.
 - **Fuzzy matching is simple.** It returns the first user above the threshold rather than the best match, loads all
   users per lookup, and can match the wrong person for similar names. The confirmation step only covers the "no match" case.
-- **`@Transactional` on reactive methods.** Methods return `Mono` and use blocking repositories, so the Spring
-  transaction does not reliably span the reactive chain; a failure midway can leave partial data
-  (for example a confirmation marked `CONFIRMED` before the debt is saved).
+- **No multi-statement transactions.** The pipeline returns `Mono` over blocking repositories, so a Spring transaction
+  would not span the reactive chain and `@Transactional` was removed from those methods; every repository call commits
+  on its own. Steps are ordered so a failure stays recoverable (a confirmation becomes `CONFIRMED` only after the debt is
+  stored, otherwise it stays `PENDING`), but a crash midway can still leave a created person without a debt record.
+- **Failed messages are not retried.** A message is marked processed before analysis; if processing fails it is
+  only logged, so that message needs to be re-sent by the user.
 - **Payments are minimal.** A `PaymentRecord` stores amount and reason for the sender only, with no counterparty,
   and does not offset debts.
 - **Summaries not implemented.** The prompt detects summary requests (`is_summary_request`) but the bot never answers them.
-  `remindUsersWithUnpaidDebts()` exists in `ZaloService` but is not scheduled or called anywhere, and is unfinished.
+  There are no debt reminders either.
 - **Amounts** are extracted by the model as numbers (`50k` becomes `50000`), passed through `Double` into `BigDecimal`;
   the currency is implicitly VND.
 - **In-memory chat history** for `/zalo/gemini/command` is lost on restart.
@@ -261,7 +272,7 @@ Join column names in the diagram follow Hibernate's default naming.
 | GET | `/zalo/profile?userId=` | all | Proxy to the Zalo profile API |
 | POST | `/zalo/gemini/command?senderId=` (body = text) | all | Free-text chat with Gemini, in-memory history per sender |
 | GET | `/actuator/health` | all | Health check |
-| POST | `/simulate/message?senderId=&messageText=` | `dev` | Inject a fake inbound message |
+| POST | `/simulate/message?senderId=&messageText=&messageId=` | `dev` | Inject a fake inbound message (`messageId` optional; reuse one to test de-duplication) |
 | POST | `/simulate/clear-db` | `dev` | Delete all rows of the app tables (not the tokens) |
 
 ## Tech stack
@@ -275,7 +286,7 @@ Join column names in the diagram follow Hibernate's default naming.
 | AI | Google Gemini `generateContent`, model `gemini-2.5-flash` |
 | Messaging | Zalo OA Open API v2.0, Zalo OAuth v4 |
 | Libraries | Gson, Jackson, FuzzyWuzzy 1.4.0, Lombok |
-| Testing | JUnit 5, Mockito, Reactor Test, OkHttp MockWebServer 4.12 |
+| Testing | JUnit 5, Mockito, Reactor Test, OkHttp MockWebServer 4.12, H2 (in-memory, tests only) |
 | CI | GitHub Actions (`./gradlew build`) |
 
 ## Getting started
@@ -335,15 +346,22 @@ webhook to `https://<public-host>/zalo/webhook` (for example through a tunnel).
 ./gradlew test        # or ./gradlew build, which also packages the jar
 ```
 
-14 tests, no network access or credentials needed:
+30 tests, no network access, credentials or MySQL needed:
 
 - `GeminiApiClientTest` (9, OkHttp `MockWebServer`): success, empty response, API error, API key sent as a header and
   not in the URL, debt extraction, Markdown-fenced JSON, truncated JSON, invalid JSON, API error during analysis.
 - `ZaloServiceConfirmationFlowTest` (5, Mockito + `StepVerifier`): unknown person creates a pending confirmation and asks,
   known person is recorded directly, `Có` creates the user and records the debt, `Không` records nothing,
   an invalid reply keeps the confirmation `PENDING`.
+- `MessageDeduplicationTest` (9, Mockito with an in-memory stand-in for the unique id): the same message id twice gives one
+  debt record or one confirmation question, different ids are both processed, the loser of an insert race is skipped,
+  a failing message is not retried, webhook and poller share the de-duplication, OA-sent messages are skipped.
+- `ZaloSchedulerTest` (2): an overlapping tick is skipped, a failed run does not block later ticks.
+- `PersistenceIntegrationTest` (5, `@DataJpaTest` on in-memory H2, deliberately non-transactional): alias lookup returns the
+  `AppUser` without `LazyInitializationException`, exact name beats alias, unknown name resolves to empty, the unique
+  Zalo message id is enforced, the registry registers a message once.
 
-Not covered: `EntityResolutionService`, token refresh, controllers, JPA mappings, the scheduler.
+Not covered: token refresh, controllers, the Zalo HTTP calls. The H2 tests use MySQL mode, not a real MySQL.
 
 ## Project structure
 
@@ -364,17 +382,17 @@ Not covered: `EntityResolutionService`, token refresh, controllers, JPA mappings
     │   │   └── service/       ZaloService, GeminiApiClient, EntityResolutionService,
     │   │                      ZaloTokenService, UserSimulationService (dev)
     │   └── resources/         application.properties, application-local.properties.example
-    └── test/java/.../service/ GeminiApiClientTest, ZaloServiceConfirmationFlowTest
+    └── test/java/...          GeminiApiClientTest, ZaloServiceConfirmationFlowTest, MessageDeduplicationTest,
+                               PersistenceIntegrationTest, config/ZaloSchedulerTest
 ```
 
 ## Roadmap
 
-- Deduplicate polled messages by `zalo_message_id`, or drop polling in favour of the webhook only.
 - Verify the Zalo webhook signature and protect the proxy endpoints.
 - Answer summary requests ("how much do I owe Lan?") from `debt_records`.
 - Payments with a counterparty that offset open debts; scheduled debt reminders.
-- Flyway migrations instead of `ddl-auto=update`; proper transaction boundaries around the reactive pipeline.
-- Tests for entity resolution and token refresh; an integration test with Testcontainers MySQL.
+- Flyway migrations instead of `ddl-auto=update`; one transaction around the persistence steps of a message.
+- Tests for token refresh; an integration test with Testcontainers MySQL.
 
 ## License
 
