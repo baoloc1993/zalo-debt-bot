@@ -34,9 +34,13 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeParseException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -47,6 +51,9 @@ public class ZaloService {
 
     private static final String ZALO_OPENAPI_BASE_URL = "https://openapi.zalo.me/v2.0";
     private static final String ZALO_OAUTH_BASE_URL = "https://oauth.zalo.me/v4";
+
+    private static final Set<String> YES_ANSWERS = Set.of("có", "co", "yes", "y");
+    private static final Set<String> NO_ANSWERS = Set.of("không", "khong", "no", "n");
 
     private final ZaloConfig zaloConfig;
     private final WebClient webClient;
@@ -84,47 +91,71 @@ public class ZaloService {
         zaloMessage.setZaloMessageId(messageId);
         zaloMessageRepository.save(zaloMessage);
 
-        // Check for pending confirmations first
-        return Mono.justOrEmpty(pendingUserConfirmationRepository.findByZaloUserIdAndConfirmationType(senderId, PendingUserConfirmation.ConfirmationType.PENDING))
-                .flatMap(pendingConfirmation -> handleConfirmationResponse(senderId, messageContent, pendingConfirmation))
-                .switchIfEmpty(Mono.defer(() -> {
-                    // If no pending confirmation, analyze the message
-                    return geminiApiClient.analyzeMessageForDebt(messageContent)
-                            .flatMap(analysisResult -> saveTransactionAnalysisResult(analysisResult, senderId, messageContent, messageId))
-                            .then();
-                }))
-                .then();
+        // A reply to an open "create user?" question takes precedence over normal analysis
+        Optional<PendingUserConfirmation> pending = pendingUserConfirmationRepository
+                .findFirstByZaloUserIdAndStatusOrderByCreatedAtDesc(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
+        if (pending.isPresent()) {
+            return handleConfirmationResponse(senderId, messageContent, pending.get());
+        }
+
+        return analyzeMessageForDebt(messageContent, messageId)
+                .flatMap(analysisResult -> saveTransactionAnalysisResult(analysisResult, senderId, messageContent, messageId));
     }
 
-    @Transactional
+    /**
+     * Handles the user's yes/no answer to a pending "create new user?" question.
+     * <ul>
+     *   <li>yes: the user is created, the original transaction is recorded, status becomes CONFIRMED</li>
+     *   <li>no: nothing is recorded, status becomes DENIED</li>
+     *   <li>anything else: the question is repeated and the confirmation stays PENDING</li>
+     * </ul>
+     */
     public Mono<Void> handleConfirmationResponse(String senderId, String userResponse, PendingUserConfirmation pendingConfirmation) {
-        if ("có".equalsIgnoreCase(userResponse)) {
-            // User confirmed, create new AppUser
-            AppUser newAppUser = new AppUser();
-            newAppUser.setName(pendingConfirmation.getProposedAppUserName());
-            // Assuming Zalo ID is not available for the new user yet, or might be the sender's ID if that's the logic.
-            // For now, let's leave it null or set a placeholder.
-            newAppUser.setZaloId(null); // Or some other logic to determine Zalo ID
+        String answer = userResponse == null ? "" : userResponse.trim().toLowerCase(Locale.ROOT);
+        String proposedName = pendingConfirmation.getProposedAppUserName();
 
-            return Mono.fromCallable(() -> appUserRepository.save(newAppUser))
-                    .flatMap(savedUser -> {
-                        // Now that the user is created, re-process the original message
-                        TransactionAnalysisResult analysisResult = gson.fromJson(pendingConfirmation.getAnalysisResultJson(), TransactionAnalysisResult.class);
-                        return saveTransactionAnalysisResult(analysisResult, senderId, pendingConfirmation.getOriginalMessageContent(), analysisResult.getZaloMessageId());
+        if (YES_ANSWERS.contains(answer)) {
+            logger.info("User {} confirmed creation of AppUser {}", senderId, proposedName);
+            return Mono.fromCallable(() -> {
+                        pendingConfirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
+                        pendingUserConfirmationRepository.save(pendingConfirmation);
+                        return appUserRepository.findByName(proposedName).orElseGet(() -> {
+                            AppUser newAppUser = new AppUser();
+                            newAppUser.setName(proposedName);
+                            return appUserRepository.save(newAppUser);
+                        });
                     })
-                    .doOnSuccess(v -> {
-                        pendingUserConfirmationRepository.delete(pendingConfirmation);
-                        sendMessage(senderId, "Đã tạo người dùng mới và ghi nhận giao dịch.");
-                    }).then();
-        } else if ("không".equalsIgnoreCase(userResponse)) {
-            // User declined, delete the pending confirmation
-            return Mono.fromRunnable(() -> pendingUserConfirmationRepository.delete(pendingConfirmation))
-                    .doOnSuccess(v -> sendMessage(senderId, "Đã hủy thao tác. Giao dịch không được ghi nhận."))
-                    .then();
-        } else {
-            // Unrecognized response, ask again
-            return sendMessage(senderId, "Vui lòng trả lời 'Có' hoặc 'Không'.").then();
+                    .flatMap(savedUser -> {
+                        // The person now exists, so re-processing the original message records the transaction
+                        TransactionAnalysisResult analysisResult = gson.fromJson(pendingConfirmation.getAnalysisResultJson(), TransactionAnalysisResult.class);
+                        return saveTransactionAnalysisResult(analysisResult, senderId,
+                                pendingConfirmation.getOriginalMessageContent(), pendingConfirmation.getZaloMessageId());
+                    })
+                    .then(Mono.defer(() -> notifyUser(senderId,
+                            String.format("Đã tạo người dùng '%s' và ghi nhận giao dịch.", proposedName))));
         }
+
+        if (NO_ANSWERS.contains(answer)) {
+            logger.info("User {} declined creation of AppUser {}", senderId, proposedName);
+            return Mono.fromRunnable(() -> {
+                        pendingConfirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.DENIED);
+                        pendingUserConfirmationRepository.save(pendingConfirmation);
+                    })
+                    .then(Mono.defer(() -> notifyUser(senderId,
+                            String.format("Đã hủy tạo người dùng '%s'. Giao dịch không được ghi nhận.", proposedName))));
+        }
+
+        return notifyUser(senderId, "Vui lòng trả lời 'Có' hoặc 'Không'.");
+    }
+
+    /** Sends a Zalo message; a delivery failure is logged but never fails the surrounding flow. */
+    private Mono<Void> notifyUser(String userId, String text) {
+        return Mono.defer(() -> sendMessage(userId, text))
+                .then()
+                .onErrorResume(e -> {
+                    logger.warn("Could not notify user {}: {}", userId, e.getMessage());
+                    return Mono.empty();
+                });
     }
 
     public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository, ZaloTokenService zaloTokenService) {
@@ -354,9 +385,13 @@ public class ZaloService {
                     String appUserName = analysisResult.getAppUserName();
                     BigDecimal amount = analysisResult.getAmount() != null ? BigDecimal.valueOf(analysisResult.getAmount()) : null;
                     String reason = analysisResult.getReason();
-                    LocalDate transactionDate = analysisResult.getTransactionDate() != null ? LocalDate.parse(analysisResult.getTransactionDate()) : null;
+                    LocalDate transactionDate = parseDate(analysisResult.getTransactionDate());
 
                     if ("debt".equals(transactionType)) {
+                        if (appUserName == null || appUserName.isBlank()) {
+                            logger.warn("Debt transaction without a counterparty name; ignoring.");
+                            return Mono.empty();
+                        }
                         return entityResolutionService.resolveAppUser(appUserName)
                                 .flatMap(otherUserOptional -> {
                                     if (otherUserOptional.isPresent()) {
@@ -378,19 +413,18 @@ public class ZaloService {
                                         }
                                         return Mono.fromCallable(() -> debtRecordRepository.save(debtRecord)).then();
                                     } else {
-                                        // AppUser not found, send confirmation message
+                                        // Unknown person: remember the transaction and ask the sender to confirm
+                                        PendingUserConfirmation pendingConfirmation = new PendingUserConfirmation();
+                                        pendingConfirmation.setZaloUserId(zaloUserId);
+                                        pendingConfirmation.setOriginalMessageContent(messageContent);
+                                        pendingConfirmation.setAnalysisResultJson(gson.toJson(analysisResult));
+                                        pendingConfirmation.setConfirmationType(PendingUserConfirmation.ConfirmationType.CREATE_APP_USER);
+                                        pendingConfirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.PENDING);
+                                        pendingConfirmation.setProposedAppUserName(appUserName);
+                                        pendingConfirmation.setZaloMessageId(zaloMessageId);
                                         String confirmationMessage = String.format("Không tìm thấy người dùng '%s'. Bạn có muốn tạo người dùng mới với tên này không? (Có/Không)", appUserName);
-                                        return sendMessage(zaloUserId, confirmationMessage)
-                                                .flatMap(messageId -> {
-                                                    PendingUserConfirmation pendingConfirmation = new PendingUserConfirmation();
-                                                    pendingConfirmation.setZaloUserId(zaloUserId);
-                                                    pendingConfirmation.setOriginalMessageContent(messageContent);
-                                                    pendingConfirmation.setAnalysisResultJson(gson.toJson(analysisResult));
-                                                    pendingConfirmation.setConfirmationType(PendingUserConfirmation.ConfirmationType.CREATE_APP_USER);
-                                                    pendingConfirmation.setProposedAppUserName(appUserName);
-                                                    pendingConfirmation.setZaloMessageId(zaloMessageId); // Store original Zalo message ID
-                                                    return Mono.fromCallable(() -> pendingUserConfirmationRepository.save(pendingConfirmation)).then();
-                                                });
+                                        return Mono.fromCallable(() -> pendingUserConfirmationRepository.save(pendingConfirmation))
+                                                .then(Mono.defer(() -> notifyUser(zaloUserId, confirmationMessage)));
                                     }
                                 });
                     } else if ("payment".equals(transactionType)) {
@@ -410,6 +444,18 @@ public class ZaloService {
 
 
 
+    private static LocalDate parseDate(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return LocalDate.parse(value.trim());
+        } catch (DateTimeParseException e) {
+            logger.warn("Ignoring unparsable transaction date.");
+            return null;
+        }
+    }
+
     public Mono<TransactionAnalysisResult> analyzeMessageForDebt(String messageContent, String zaloMessageId) {
         return geminiApiClient.analyzeMessageForDebt(messageContent)
                 .map(analysisResult -> {
@@ -417,39 +463,6 @@ public class ZaloService {
                     return analysisResult;
                 });
     }
-
-    @Transactional
-    public Mono<Void> handleConfirmationResponse(String zaloUserId, String confirmationResponse, String zaloMessageId) {
-        return Mono.fromCallable(() -> pendingUserConfirmationRepository.findByZaloUserIdAndZaloMessageId(zaloUserId, zaloMessageId))
-                .flatMap(optionalPendingConfirmation -> {
-                    if (optionalPendingConfirmation.isEmpty()) {
-                        logger.warn("No pending confirmation found for Zalo user {} with message ID {}", zaloUserId, zaloMessageId);
-                        return Mono.empty();
-                    }
-
-                    PendingUserConfirmation pendingConfirmation = optionalPendingConfirmation.get();
-                    pendingUserConfirmationRepository.delete(pendingConfirmation);
-
-                    if (confirmationResponse.equalsIgnoreCase("Có")) {
-                        logger.info("User {} confirmed creation of AppUser {}", zaloUserId, pendingConfirmation.getProposedAppUserName());
-                        AppUser newAppUser = new AppUser();
-                        newAppUser.setName(pendingConfirmation.getProposedAppUserName());
-                        return Mono.fromCallable(() -> appUserRepository.save(newAppUser))
-                                .flatMap(savedAppUser -> {
-                                    logger.info("New AppUser {} created. Re-processing original message.", savedAppUser.getName());
-                                    TransactionAnalysisResult analysisResult = gson.fromJson(pendingConfirmation.getAnalysisResultJson(), TransactionAnalysisResult.class);
-                                    return saveTransactionAnalysisResult(analysisResult, zaloUserId, pendingConfirmation.getOriginalMessageContent(), analysisResult.getZaloMessageId())
-                                            .then(sendMessage(zaloUserId, String.format("Đã tạo người dùng '%s' và xử lý giao dịch của bạn.", savedAppUser.getName())));
-                                });
-                    } else {
-                        logger.info("User {} declined creation of AppUser {}", zaloUserId, pendingConfirmation.getProposedAppUserName());
-                        return sendMessage(zaloUserId, String.format("Đã hủy tạo người dùng '%s'. Giao dịch không được xử lý.", pendingConfirmation.getProposedAppUserName()));
-                    }
-                })
-                .then();
-    }
-
-
 
     /** Parses the comma-separated {@code zalo.scheduled.users} setting, ignoring blank entries. */
     private List<String> getScheduledUserIds() {
@@ -529,10 +542,10 @@ public class ZaloService {
                     reminderMessage.setZaloMessageId(messageId);
                     zaloMessageRepository.save(reminderMessage);
 
-                    return Mono.justOrEmpty(pendingUserConfirmationRepository.findByZaloUserIdAndConfirmationType(userId, PendingUserConfirmation.ConfirmationType.PENDING))
+                    return Mono.justOrEmpty(pendingUserConfirmationRepository.findFirstByZaloUserIdAndStatusOrderByCreatedAtDesc(userId, PendingUserConfirmation.ConfirmationStatus.PENDING))
                             .flatMap(pendingConfirmation -> handleConfirmationResponse(userId, "có", pendingConfirmation)) // Auto-confirm for reminders
                             .switchIfEmpty(Mono.defer(() ->
-                                    geminiApiClient.analyzeMessageForDebt(messageContent)
+                                    analyzeMessageForDebt(messageContent, messageId)
                                         .flatMap(analysisResult ->
                                             saveTransactionAnalysisResult(analysisResult, userId, messageContent, messageId))
                                         .then()

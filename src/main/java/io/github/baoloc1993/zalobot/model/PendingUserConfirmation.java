@@ -28,6 +28,10 @@ public class PendingUserConfirmation {
     @Enumerated(EnumType.STRING)
     private ConfirmationType confirmationType;
 
+    @Column(name = "status", nullable = false)
+    @Enumerated(EnumType.STRING)
+    private ConfirmationStatus status = ConfirmationStatus.PENDING;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 
@@ -37,9 +41,23 @@ public class PendingUserConfirmation {
     @Column(name = "analysis_result_json", columnDefinition = "TEXT")
     private String analysisResultJson;
 
+    /** What the bot is asking the user to confirm. */
     public enum ConfirmationType {
-        CREATE_APP_USER,
-        PENDING
+        CREATE_APP_USER
+    }
+
+    /** Lifecycle of a confirmation request: waiting for an answer, then accepted or rejected. */
+    public enum ConfirmationStatus {
+        PENDING,
+        CONFIRMED,
+        DENIED
+    }
+
+    @PrePersist
+    protected void onCreate() {
+        if (createdAt == null) {
+            createdAt = LocalDateTime.now();
+        }
     }
 
     // Getters and Setters
@@ -81,6 +99,14 @@ public class PendingUserConfirmation {
 
     public void setConfirmationType(ConfirmationType confirmationType) {
         this.confirmationType = confirmationType;
+    }
+
+    public ConfirmationStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(ConfirmationStatus status) {
+        this.status = status;
     }
 
     public LocalDateTime getCreatedAt() {
