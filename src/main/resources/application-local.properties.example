@@ -1,0 +1,19 @@
+# Copy to application-local.properties (git-ignored) for local development.
+# Values here override application.properties when the "local" profile is active,
+# so you don't need to export environment variables.
+
+zalo.app.id=your-zalo-app-id
+zalo.app.secret=your-zalo-app-secret
+zalo.oa.id=your-zalo-oa-id
+zalo.scheduled.users=
+
+gemini.api.key=your-gemini-api-key
+
+spring.datasource.url=jdbc:mysql://localhost:3306/zalobot?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+spring.datasource.username=zalobot
+spring.datasource.password=change-me
+
+# Verbose SQL logging for debugging
+spring.jpa.show-sql=true
+logging.level.org.hibernate.SQL=debug
+logging.level.io.github.baoloc1993.zalobot=debug
