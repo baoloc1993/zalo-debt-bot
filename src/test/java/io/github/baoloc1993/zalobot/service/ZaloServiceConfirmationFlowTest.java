@@ -64,11 +64,13 @@ class ZaloServiceConfirmationFlowTest {
         pendingRepository = mock(PendingUserConfirmationRepository.class);
         entityResolutionService = mock(EntityResolutionService.class);
         ZaloConfig config = mock(ZaloConfig.class);
+        InboundMessageRegistry inboundMessageRegistry = mock(InboundMessageRegistry.class);
+        when(inboundMessageRegistry.tryRegister(any())).thenReturn(true);
 
         service = spy(new ZaloService(config, WebClient.builder(), geminiApiClient,
                 mock(ZaloMessageRepository.class), debtRecordRepository, appUserRepository,
                 mock(PaymentRecordRepository.class), entityResolutionService, pendingRepository,
-                mock(UserAliasRepository.class), mock(ZaloTokenService.class)));
+                mock(UserAliasRepository.class), mock(ZaloTokenService.class), inboundMessageRegistry));
         doReturn(Mono.just("sent")).when(service).sendMessage(anyString(), anyString());
 
         sender = new AppUser();

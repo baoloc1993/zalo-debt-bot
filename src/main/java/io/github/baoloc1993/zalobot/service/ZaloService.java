@@ -22,10 +22,10 @@ import io.github.baoloc1993.zalobot.repository.ZaloMessageRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
 import java.net.URI;
@@ -66,6 +66,7 @@ public class ZaloService {
     private final PendingUserConfirmationRepository pendingUserConfirmationRepository;
     private final UserAliasRepository userAliasRepository;
     private final ZaloTokenService zaloTokenService;
+    private final InboundMessageRegistry inboundMessageRegistry;
     private final Gson gson = new Gson();
 
     private final Map<String, List<GeminiMessage>> conversationHistories = new ConcurrentHashMap<>();
@@ -75,31 +76,44 @@ public class ZaloService {
     }
 
 
-    @Transactional
+    /**
+     * Single entry point for inbound user messages (webhook, scheduled polling and the dev simulator).
+     * <p>
+     * The message is first registered by its Zalo message id; a message that was already registered
+     * (a repeated webhook delivery, the next polling tick, an overlapping run) is skipped. A message
+     * that fails during processing is logged and is <em>not</em> retried, so a poison message cannot
+     * be reprocessed forever.
+     */
     public Mono<Void> processIncomingZaloMessage(String senderId, String messageContent, String messageId) {
-        logger.info("Processing incoming Zalo message {} from senderId {}", messageId, senderId);
-        logger.debug("Message content: {}", messageContent);
-
-        // Save incoming message
         ZaloMessage zaloMessage = new ZaloMessage();
         zaloMessage.setSenderId(senderId);
-        zaloMessage.setReceiverId(zaloConfig.getOaId()); // Assuming the bot is the receiver
+        zaloMessage.setReceiverId(zaloConfig.getOaId());
         zaloMessage.setMessageContent(messageContent);
         zaloMessage.setMessageType("text");
         zaloMessage.setTimestamp(LocalDateTime.now());
         zaloMessage.setDirection(ZaloMessage.Direction.inbound);
         zaloMessage.setZaloMessageId(messageId);
-        zaloMessageRepository.save(zaloMessage);
 
-        // A reply to an open "create user?" question takes precedence over normal analysis
-        Optional<PendingUserConfirmation> pending = pendingUserConfirmationRepository
-                .findFirstByZaloUserIdAndStatusOrderByCreatedAtDesc(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
-        if (pending.isPresent()) {
-            return handleConfirmationResponse(senderId, messageContent, pending.get());
+        if (!inboundMessageRegistry.tryRegister(zaloMessage)) {
+            logger.info("Zalo message {} was already processed; skipping.", messageId);
+            return Mono.empty();
         }
+        logger.info("Processing incoming Zalo message {} from senderId {}", messageId, senderId);
 
-        return analyzeMessageForDebt(messageContent, messageId)
-                .flatMap(analysisResult -> saveTransactionAnalysisResult(analysisResult, senderId, messageContent, messageId));
+        return Mono.defer(() -> {
+                    // A reply to an open "create user?" question takes precedence over normal analysis
+                    Optional<PendingUserConfirmation> pending = pendingUserConfirmationRepository
+                            .findFirstByZaloUserIdAndStatusOrderByCreatedAtDesc(senderId, PendingUserConfirmation.ConfirmationStatus.PENDING);
+                    if (pending.isPresent()) {
+                        return handleConfirmationResponse(senderId, messageContent, pending.get());
+                    }
+                    return analyzeMessageForDebt(messageContent, messageId)
+                            .flatMap(analysisResult -> saveTransactionAnalysisResult(analysisResult, senderId, messageContent, messageId));
+                })
+                .onErrorResume(e -> {
+                    logger.warn("Processing of Zalo message {} failed and will not be retried: {}", messageId, e.toString());
+                    return Mono.empty();
+                });
     }
 
     /**
@@ -116,21 +130,22 @@ public class ZaloService {
 
         if (YES_ANSWERS.contains(answer)) {
             logger.info("User {} confirmed creation of AppUser {}", senderId, proposedName);
-            return Mono.fromCallable(() -> {
-                        pendingConfirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
-                        pendingUserConfirmationRepository.save(pendingConfirmation);
-                        return appUserRepository.findByName(proposedName).orElseGet(() -> {
-                            AppUser newAppUser = new AppUser();
-                            newAppUser.setName(proposedName);
-                            return appUserRepository.save(newAppUser);
-                        });
-                    })
+            return Mono.fromCallable(() -> appUserRepository.findByName(proposedName).orElseGet(() -> {
+                        AppUser newAppUser = new AppUser();
+                        newAppUser.setName(proposedName);
+                        return appUserRepository.save(newAppUser);
+                    }))
                     .flatMap(savedUser -> {
                         // The person now exists, so re-processing the original message records the transaction
                         TransactionAnalysisResult analysisResult = gson.fromJson(pendingConfirmation.getAnalysisResultJson(), TransactionAnalysisResult.class);
                         return saveTransactionAnalysisResult(analysisResult, senderId,
                                 pendingConfirmation.getOriginalMessageContent(), pendingConfirmation.getZaloMessageId());
                     })
+                    // Mark CONFIRMED only after the transaction was stored; on failure it stays PENDING
+                    .then(Mono.fromRunnable(() -> {
+                        pendingConfirmation.setStatus(PendingUserConfirmation.ConfirmationStatus.CONFIRMED);
+                        pendingUserConfirmationRepository.save(pendingConfirmation);
+                    }))
                     .then(Mono.defer(() -> notifyUser(senderId,
                             String.format("Đã tạo người dùng '%s' và ghi nhận giao dịch.", proposedName))));
         }
@@ -158,7 +173,7 @@ public class ZaloService {
                 });
     }
 
-    public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository, ZaloTokenService zaloTokenService) {
+    public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository, ZaloTokenService zaloTokenService, InboundMessageRegistry inboundMessageRegistry) {
         this.zaloConfig = zaloConfig;
         this.webClient = webClientBuilder.baseUrl(ZALO_OPENAPI_BASE_URL).build();
         this.geminiApiClient = geminiApiClient;
@@ -170,6 +185,7 @@ public class ZaloService {
         this.pendingUserConfirmationRepository = pendingUserConfirmationRepository;
         this.userAliasRepository = userAliasRepository;
         this.zaloTokenService = zaloTokenService;
+        this.inboundMessageRegistry = inboundMessageRegistry;
     }
 
     public ZaloConfig getZaloConfig() {
@@ -364,7 +380,6 @@ public class ZaloService {
     }
 
 
-    @Transactional
     public Mono<Void> saveTransactionAnalysisResult(TransactionAnalysisResult analysisResult, String zaloUserId, String messageContent, String zaloMessageId) {
         logger.info("Attempting to save transaction analysis result for user {}: {}", zaloUserId, analysisResult);
         if (!analysisResult.isTransactionRelated()) {
@@ -464,6 +479,52 @@ public class ZaloService {
                 });
     }
 
+    /**
+     * Polls the latest message of every configured user and feeds it through
+     * {@link #processIncomingZaloMessage}, i.e. with the same de-duplication, confirmation handling
+     * and analysis as the webhook. A failure for one user does not stop the others.
+     */
+    public Flux<String> readMessages() {
+        List<String> userIds = getScheduledUserIds();
+        logger.info("Reading latest messages for {} scheduled user(s).", userIds.size());
+
+        return Flux.fromIterable(userIds)
+                .flatMap(userId -> processLatestMessage(userId)
+                        .onErrorResume(e -> {
+                            logger.warn("Reading messages for user {} failed: {}", userId, e.toString());
+                            return Mono.empty();
+                        }))
+                .doOnComplete(() -> logger.info("Finished reading messages for all configured users."));
+    }
+
+    public Mono<String> processLatestMessage(String userId) {
+        return getConversation(userId, 0, 1)
+                // persistence below is blocking JPA, so leave the HTTP client's event-loop thread
+                .publishOn(Schedulers.boundedElastic())
+                .flatMap(response -> {
+                    JsonArray dataArray = JsonParser.parseString(response).getAsJsonObject().getAsJsonArray("data");
+                    if (dataArray == null || dataArray.isEmpty()) {
+                        return Mono.just("No messages for user " + userId);
+                    }
+                    JsonObject latest = dataArray.get(0).getAsJsonObject();
+                    String messageContent = jsonString(latest, "message");
+                    String messageId = jsonString(latest, "msg_id");
+                    String fromId = jsonString(latest, "from_id");
+                    if (messageContent == null || messageContent.isBlank()) {
+                        return Mono.just("Latest message of user " + userId + " has no text; skipped");
+                    }
+                    if (fromId != null && fromId.equals(zaloConfig.getOaId())) {
+                        return Mono.just("Latest message of user " + userId + " was sent by the OA; skipped");
+                    }
+                    return processIncomingZaloMessage(userId, messageContent, messageId)
+                            .thenReturn("Handled latest message " + messageId + " of user " + userId);
+                });
+    }
+
+    private static String jsonString(JsonObject obj, String key) {
+        return obj.has(key) && !obj.get(key).isJsonNull() ? obj.get(key).getAsString() : null;
+    }
+
     /** Parses the comma-separated {@code zalo.scheduled.users} setting, ignoring blank entries. */
     private List<String> getScheduledUserIds() {
         String userIdsString = zaloConfig.getScheduledUsers();
@@ -474,83 +535,5 @@ public class ZaloService {
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .toList();
-    }
-
-    public Flux<String> readMessages() {
-        List<String> userIds = getScheduledUserIds();
-        logger.info("Reading latest messages for {} scheduled user(s).", userIds.size());
-
-        return Flux.fromIterable(userIds)
-                .flatMap(userId -> getAndAnalyzeLatestMessage(userId)
-                        .map(analysisResult -> "Processed message for user " + userId + ": " + analysisResult.getAnalysisJson()))
-                .doOnError(e -> logger.error("Error during message processing: {}", e.getMessage()))
-                .doOnComplete(() -> logger.info("Finished processing messages for all configured users."));
-    }
-
-    public Mono<TransactionAnalysisResult> getAndAnalyzeLatestMessage(String userId) {
-        return getConversation(userId, 0, 1)
-                .flatMap(response -> {
-                    try {
-                        JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
-                        JsonArray dataArray = jsonResponse.getAsJsonArray("data");
-                        if (dataArray != null && dataArray.size() > 0) {
-                            JsonObject latestMessage = dataArray.get(0).getAsJsonObject();
-                            String messageContent = latestMessage.get("message").getAsString();
-                            String messageId = latestMessage.get("msg_id").getAsString();
-                            logger.info("Extracted latest message {} for user {}", messageId, userId);
-                            return analyzeMessageForDebt(messageContent, messageId)
-                                .flatMap(analysisResult -> {
-                                    if (analysisResult.isTransactionRelated()) {
-                                        return saveTransactionAnalysisResult(analysisResult, userId, messageContent, messageId)
-                                                .thenReturn(analysisResult);
-                                    } else {
-                                        return Mono.just(analysisResult);
-                                    }
-                                });
-                        } else {
-                            logger.info("No messages found for user {}", userId);
-                            return Mono.empty();
-                        }
-                    } catch (Exception e) {
-                        logger.error("Error parsing conversation response for user {}: {}", userId, e.getMessage());
-                        return Mono.error(new RuntimeException("Failed to parse conversation response", e));
-                    }
-                });
-    }
-
-    @Transactional
-    public Mono<Void> remindUsersWithUnpaidDebts() {
-        List<String> userIds = getScheduledUserIds();
-        if (userIds.isEmpty()) {
-            logger.info("No scheduled users to remind.");
-            return Mono.empty();
-        }
-
-        return Flux.fromIterable(userIds)
-                .flatMap(userId -> {
-                    // Similar to processIncomingZaloMessage, but initiated by the system
-                    String messageContent = "Nhắc nợ"; // Example message
-                    String messageId = UUID.randomUUID().toString();
-
-                    ZaloMessage reminderMessage = new ZaloMessage();
-                    reminderMessage.setSenderId(zaloConfig.getOaId());
-                    reminderMessage.setReceiverId(userId);
-                    reminderMessage.setMessageContent(messageContent);
-                    reminderMessage.setMessageType("text");
-                    reminderMessage.setTimestamp(LocalDateTime.now());
-                    reminderMessage.setDirection(ZaloMessage.Direction.outbound);
-                    reminderMessage.setZaloMessageId(messageId);
-                    zaloMessageRepository.save(reminderMessage);
-
-                    return Mono.justOrEmpty(pendingUserConfirmationRepository.findFirstByZaloUserIdAndStatusOrderByCreatedAtDesc(userId, PendingUserConfirmation.ConfirmationStatus.PENDING))
-                            .flatMap(pendingConfirmation -> handleConfirmationResponse(userId, "có", pendingConfirmation)) // Auto-confirm for reminders
-                            .switchIfEmpty(Mono.defer(() ->
-                                    analyzeMessageForDebt(messageContent, messageId)
-                                        .flatMap(analysisResult ->
-                                            saveTransactionAnalysisResult(analysisResult, userId, messageContent, messageId))
-                                        .then()
-                            ));
-                })
-                .then();
     }
 }

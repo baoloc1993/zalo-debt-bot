@@ -6,4 +6,6 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public interface ZaloMessageRepository extends JpaRepository<ZaloMessage, Long> {
+
+    boolean existsByZaloMessageId(String zaloMessageId);
 }

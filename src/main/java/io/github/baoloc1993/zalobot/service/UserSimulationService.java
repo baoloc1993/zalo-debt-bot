@@ -6,6 +6,8 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
+import java.util.UUID;
+
 @Service
 @Profile("dev")
 public class UserSimulationService {
@@ -18,9 +20,14 @@ public class UserSimulationService {
         this.zaloService = zaloService;
     }
 
-    public Mono<Void> simulateIncomingMessage(String senderId, String messageText) {
-        logger.debug("SIMULATION: User {} sends message: {}", senderId, messageText);
-        return zaloService.processIncomingZaloMessage(senderId, messageText, "simulated_message_id")
+    /**
+     * @param messageId Zalo message id to use; sending the same id twice exercises de-duplication.
+     *                  A random id is generated when {@code null} or blank.
+     */
+    public Mono<Void> simulateIncomingMessage(String senderId, String messageText, String messageId) {
+        String id = (messageId == null || messageId.isBlank()) ? "sim-" + UUID.randomUUID() : messageId;
+        logger.debug("SIMULATION: User {} sends message {}: {}", senderId, id, messageText);
+        return zaloService.processIncomingZaloMessage(senderId, messageText, id)
                 .then();
     }
 }

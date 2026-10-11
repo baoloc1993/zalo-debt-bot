@@ -43,8 +43,9 @@ public class UserSimulationController {
     }
 
     @PostMapping("/message")
-    public Mono<String> simulateMessage(@RequestParam String senderId, @RequestParam String messageText) {
-        return userSimulationService.simulateIncomingMessage(senderId, messageText)
+    public Mono<String> simulateMessage(@RequestParam String senderId, @RequestParam String messageText,
+                                        @RequestParam(required = false) String messageId) {
+        return userSimulationService.simulateIncomingMessage(senderId, messageText, messageId)
                 .thenReturn("Simulation of incoming message sent successfully.");
     }
 
