@@ -1,6 +1,5 @@
 # Zalo Debt Bot
 
-[![build](https://github.com/baoloc1993/zalo-debt-bot/actions/workflows/build.yml/badge.svg)](https://github.com/baoloc1993/zalo-debt-bot/actions/workflows/build.yml)
 ![Java 17](https://img.shields.io/badge/Java-17-orange)
 ![Spring Boot 3.4.0](https://img.shields.io/badge/Spring%20Boot-3.4.0-6DB33F)
 ![Gradle 8.14](https://img.shields.io/badge/build-Gradle%208.14-02303A)
