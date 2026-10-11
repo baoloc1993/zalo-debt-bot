@@ -2,6 +2,7 @@ package io.github.baoloc1993.zalobot.model;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
+import lombok.EqualsAndHashCode;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
@@ -26,6 +27,7 @@ public class AppUser {
     private String zaloId;
 
     @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     @OneToMany(mappedBy = "appUser", cascade = CascadeType.ALL, orphanRemoval = true)
     private Set<UserAlias> aliases = new HashSet<>();
 

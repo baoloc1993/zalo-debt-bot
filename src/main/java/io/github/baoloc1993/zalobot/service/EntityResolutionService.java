@@ -4,14 +4,19 @@ import io.github.baoloc1993.zalobot.model.AppUser;
 import io.github.baoloc1993.zalobot.repository.AppUserRepository;
 import io.github.baoloc1993.zalobot.repository.UserAliasRepository;
 import me.xdrop.fuzzywuzzy.FuzzySearch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.List;
 import java.util.Optional;
-import reactor.core.publisher.Mono;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+/**
+ * Resolves a name mentioned in a message to a known {@link AppUser}: exact name, then alias,
+ * then fuzzy match.
+ */
 @Service
 public class EntityResolutionService {
 
@@ -27,34 +32,32 @@ public class EntityResolutionService {
         this.userAliasRepository = userAliasRepository;
     }
 
+    /** Never empty: emits {@code Optional.empty()} when nobody matches. Blocking lookups run on boundedElastic. */
     public Mono<Optional<AppUser>> resolveAppUser(String name) {
-        logger.info("Attempting to resolve AppUser for name: {}", name);
-        // Step 1: Exact match on AppUser name
-        return Mono.justOrEmpty(appUserRepository.findByName(name))
-                .map(Optional::of)
-                .doOnNext(appUserOpt -> appUserOpt.ifPresent(appUser -> logger.info("Found AppUser by exact name match: {}", appUser.getName())))
-                .switchIfEmpty(Mono.defer(() -> {
-                    logger.info("No exact AppUser name match for {}. Checking aliases.", name);
-                    // Step 2: Exact match on UserAlias
-                    return Mono.justOrEmpty(userAliasRepository.findByAlias(name))
-                            .map(userAlias -> Optional.of(userAlias.getAppUser()))
-                            .doOnNext(appUserOpt -> appUserOpt.ifPresent(appUser -> logger.info("Found AppUser by alias: {}", appUser.getName())))
-                            .switchIfEmpty(Mono.defer(() -> {
-                                logger.info("No alias match for {}. Attempting fuzzy match.", name);
-                                // Step 3: Fuzzy match
-                                return Mono.fromCallable(() -> {
-                                    List<AppUser> allUsers = appUserRepository.findAll();
-                                    return allUsers.stream()
-                                                    .filter(user -> FuzzySearch.ratio(user.getName(), name) > FUZZY_MATCH_THRESHOLD)
-                                                    .findFirst();
-                                        }).flatMap(Mono::justOrEmpty)
-                                                .map(Optional::of)
-                                                .doOnNext(appUserOpt -> appUserOpt.ifPresent(appUser -> logger.info("Found AppUser by fuzzy match: {}", appUser.getName())))
-                                                .switchIfEmpty(Mono.defer(() -> {
-                                                    logger.info("No fuzzy match found for {}.", name);
-                                                    return Mono.just(Optional.empty());
-                                                }));
-                            }));
-                }));
+        return Mono.fromCallable(() -> resolveBlocking(name)).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Optional<AppUser> resolveBlocking(String name) {
+        if (name == null || name.isBlank()) {
+            return Optional.empty();
+        }
+
+        Optional<AppUser> byName = appUserRepository.findByName(name);
+        if (byName.isPresent()) {
+            logger.info("Resolved a person by exact name match.");
+            return byName;
+        }
+
+        List<AppUser> byAlias = userAliasRepository.findAppUsersByAlias(name);
+        if (!byAlias.isEmpty()) {
+            logger.info("Resolved a person by alias.");
+            return Optional.of(byAlias.get(0));
+        }
+
+        Optional<AppUser> fuzzy = appUserRepository.findAll().stream()
+                .filter(user -> FuzzySearch.ratio(user.getName(), name) > FUZZY_MATCH_THRESHOLD)
+                .findFirst();
+        logger.info(fuzzy.isPresent() ? "Resolved a person by fuzzy match." : "No person matched the name.");
+        return fuzzy;
     }
 }
