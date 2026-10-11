@@ -10,11 +10,10 @@ person is (exact name, alias or fuzzy match) and records the transaction. If the
 other person is unknown, the bot asks the sender whether a new person should be
 created before recording anything.
 
-> **Status: work in progress.** The pipeline (webhook, persistence, entity
-> resolution, confirmation prompts, Zalo token handling, Gemini client) is in
-> place, but the message classifier `GeminiApiClient#analyzeMessageForDebt` is
-> currently a stub that returns an empty result, so incoming messages are not yet
-> turned into debt/payment records. See [Known limitations](#known-limitations).
+> **Status: work in progress.** The full path from webhook message to stored
+> debt/payment record, including the "create new person?" confirmation, is
+> implemented and unit-tested, but it has not been verified against a live Zalo
+> OA in its current form. See [Known limitations](#known-limitations).
 
 ## Features
 
@@ -26,9 +25,14 @@ created before recording anything.
   Payments are stored per user.
 - **Entity resolution** – the counterparty name is resolved by exact name, then by
   alias, then by fuzzy matching (FuzzyWuzzy ratio > 80).
+- **Gemini message analysis** – each message is sent to Gemini with a prompt
+  that asks for a JSON object (transaction type, direction, counterparty, amount,
+  reason, date). Markdown fences are stripped; truncated or invalid JSON is
+  logged as a warning and treated as "not a transaction".
 - **Confirmation flow** – if no matching person exists, the bot replies on Zalo
   asking whether to create one (*Có/Không*) and parks the analysed transaction in
-  `pending_user_confirmations` until the user answers.
+  `pending_user_confirmations` (status `PENDING`) until the user answers
+  (see [Confirmation flow](#confirmation-flow)).
 - **Zalo OAuth v4** – exchanges the authorization code for access/refresh tokens
   (`GET /zalo/callback`), stores them, and refreshes the access token
   automatically when it expires.
@@ -91,6 +95,19 @@ sequenceDiagram
 Outbound Zalo calls (`sendMessage`, `getConversation`, `getProfile`) go through
 `getValidAccessToken()`, which loads the latest token from `zalo_tokens` and
 refreshes it via OAuth v4 when it has expired.
+
+### Confirmation flow
+
+1. The sender writes e.g. *"Tôi nợ Lan 50k tiền ăn trưa"*. Gemini returns
+   `debt` / `USER_OWES_OTHER` / `Lan` / `50000`.
+2. "Lan" matches no known person, so a `pending_user_confirmations` row
+   (`type=CREATE_APP_USER`, `status=PENDING`, with the analysis JSON and the
+   original message) is saved and the bot asks whether to create the person (Có/Không).
+3. The sender's next message is treated as the answer while a `PENDING` row exists:
+   - **Có / co / yes / y** – the person is created, the stored transaction is
+     recorded (debtor/creditor according to the direction) and the row becomes `CONFIRMED`.
+   - **Không / khong / no / n** – nothing is recorded and the row becomes `DENIED`.
+   - anything else – the bot asks again and the row stays `PENDING`.
 
 ### Data model
 
@@ -166,9 +183,14 @@ curl -X POST "http://localhost:8081/simulate/message" \
 ./gradlew test      # or: ./gradlew build
 ```
 
-Tests run without network access or real credentials: `GeminiApiClientTest`
-uses OkHttp `MockWebServer` to stub the Gemini API (success, empty response,
-HTTP error, and that the API key is sent as a header rather than in the URL).
+Tests run without network access or real credentials:
+
+- `GeminiApiClientTest` uses OkHttp `MockWebServer` to stub the Gemini API:
+  plain responses, errors, the API key sent as a header, and debt extraction
+  (clean JSON, fenced JSON, truncated/invalid JSON, API errors).
+- `ZaloServiceConfirmationFlowTest` uses Mockito for the repositories and the
+  Gemini client and covers: unknown person -> confirmation question, known
+  person -> direct record, and the yes / no / invalid replies.
 
 ## Project structure
 
@@ -190,11 +212,12 @@ src/test/java/.../service/GeminiApiClientTest.java
 
 ## Known limitations
 
-- `GeminiApiClient#analyzeMessageForDebt` is a placeholder; the prompt-based
-  extraction still has to be wired in, so no records are created from real
-  messages yet.
-- New confirmations are stored with type `CREATE_APP_USER`, while incoming
-  messages look up confirmations of type `PENDING`, so the *Có/Không* reply is
-  not yet routed back to the pending transaction.
+- The scheduled poller re-reads each configured user's latest message every
+  60 s without remembering which message it has already processed, so one
+  message can be processed repeatedly.
+- Summary requests ("how much do I owe?") are recognised by the analysis but not
+  answered yet.
+- Zalo API calls (OAuth, sending messages, conversation) are not covered by
+  tests; only Gemini calls and the confirmation flow are.
 - Gemini chat history for `/zalo/gemini/command` is kept in memory only.
 - The schema is managed by Hibernate `ddl-auto=update`; there are no migrations.
