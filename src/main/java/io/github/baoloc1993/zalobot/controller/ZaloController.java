@@ -61,7 +61,7 @@ public class ZaloController {
 
     @PostMapping("/zalo/webhook")
     public Mono<String> handleZaloWebhook(@RequestBody String payload) {
-        logger.info("Received Zalo webhook payload: {}", payload);
+        logger.debug("Received Zalo webhook payload ({} chars).", payload.length());
         return Mono.fromCallable(() -> {
                     logger.debug("Attempting to parse Zalo webhook payload.");
                     return objectMapper.readValue(payload, ZaloWebhookEvent.class);
@@ -71,7 +71,7 @@ public class ZaloController {
                     String senderId = event.getSenderId();
                     String messageText = event.getMessage() != null ? event.getMessage().getText() : "";
                     String zaloMessageId = event.getMessage() != null ? event.getMessage().getMsgId() : null;
-                    logger.info("Received Zalo message from senderId: {} with text: {} and msgId: {}", senderId, messageText, zaloMessageId);
+                    logger.info("Received Zalo message {} from senderId {}", zaloMessageId, senderId);
 
                     if (messageText.isEmpty()) {
                         logger.warn("Received empty message from senderId: {}. Skipping processing.", senderId);

@@ -1,59 +1,52 @@
 package io.github.baoloc1993.zalobot.service;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.Properties;
-
-import java.math.BigDecimal;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import io.github.baoloc1993.zalobot.config.ZaloConfig;
 import io.github.baoloc1993.zalobot.model.AppUser;
-import io.github.baoloc1993.zalobot.model.UserAlias;
 import io.github.baoloc1993.zalobot.model.DebtRecord;
-import io.github.baoloc1993.zalobot.model.gemini.GeminiMessage;
 import io.github.baoloc1993.zalobot.model.PaymentRecord;
 import io.github.baoloc1993.zalobot.model.PendingUserConfirmation;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.HashSet;
 import io.github.baoloc1993.zalobot.model.TransactionAnalysisResult;
 import io.github.baoloc1993.zalobot.model.ZaloMessage;
 import io.github.baoloc1993.zalobot.model.ZaloToken;
+import io.github.baoloc1993.zalobot.model.gemini.GeminiMessage;
 import io.github.baoloc1993.zalobot.repository.AppUserRepository;
 import io.github.baoloc1993.zalobot.repository.DebtRecordRepository;
 import io.github.baoloc1993.zalobot.repository.PaymentRecordRepository;
 import io.github.baoloc1993.zalobot.repository.PendingUserConfirmationRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import io.github.baoloc1993.zalobot.repository.UserAliasRepository;
 import io.github.baoloc1993.zalobot.repository.ZaloMessageRepository;
-import io.github.baoloc1993.zalobot.config.ZaloConfig;
-import io.github.baoloc1993.zalobot.service.GeminiApiClient;
-import io.github.baoloc1993.zalobot.service.ZaloTokenService;
-import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import com.google.gson.JsonSyntaxException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.math.BigDecimal;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeParseException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
-import reactor.core.publisher.Flux;
-import org.springframework.beans.factory.annotation.Value;
-import java.util.Arrays;
 
 @Service
 public class ZaloService {
     private static final Logger logger = LoggerFactory.getLogger(ZaloService.class);
+
+    private static final String ZALO_OPENAPI_BASE_URL = "https://openapi.zalo.me/v2.0";
+    private static final String ZALO_OAUTH_BASE_URL = "https://oauth.zalo.me/v4";
 
     private final ZaloConfig zaloConfig;
     private final WebClient webClient;
@@ -77,7 +70,8 @@ public class ZaloService {
 
     @Transactional
     public Mono<Void> processIncomingZaloMessage(String senderId, String messageContent, String messageId) {
-        logger.info("Entering processIncomingZaloMessage for senderId: {} with message: {}", senderId, messageContent);
+        logger.info("Processing incoming Zalo message {} from senderId {}", messageId, senderId);
+        logger.debug("Message content: {}", messageContent);
 
         // Save incoming message
         ZaloMessage zaloMessage = new ZaloMessage();
@@ -135,7 +129,7 @@ public class ZaloService {
 
     public ZaloService(ZaloConfig zaloConfig, WebClient.Builder webClientBuilder, GeminiApiClient geminiApiClient, ZaloMessageRepository zaloMessageRepository, DebtRecordRepository debtRecordRepository, AppUserRepository appUserRepository, PaymentRecordRepository paymentRecordRepository, EntityResolutionService entityResolutionService, PendingUserConfirmationRepository pendingUserConfirmationRepository, UserAliasRepository userAliasRepository, ZaloTokenService zaloTokenService) {
         this.zaloConfig = zaloConfig;
-        this.webClient = webClientBuilder.baseUrl("https://openapi.zalo.me/v2.0").build();
+        this.webClient = webClientBuilder.baseUrl(ZALO_OPENAPI_BASE_URL).build();
         this.geminiApiClient = geminiApiClient;
         this.zaloMessageRepository = zaloMessageRepository;
         this.debtRecordRepository = debtRecordRepository;
@@ -171,8 +165,8 @@ public class ZaloService {
                             .bodyValue(data.toString())
                             .retrieve()
                             .bodyToMono(String.class)
-                            .doOnSuccess(response -> logger.info("Successfully sent message to user {}: {}. Response: {}", userId, message, response))
-                            .doOnError(error -> logger.error("Failed to send message to user {}: {}. Error: {}", userId, message, error.getMessage()));
+                            .doOnSuccess(response -> logger.info("Sent message to user {}. Response: {}", userId, response))
+                            .doOnError(error -> logger.error("Failed to send message to user {}: {}", userId, error.getMessage()));
                 });
     }
 
@@ -182,9 +176,9 @@ public class ZaloService {
                     JsonObject data = new JsonObject();
                     data.addProperty("user_id", userId);
                     String dataJsonString = data.toString();
-                    String encodedDataJsonString = java.net.URLEncoder.encode(dataJsonString, java.nio.charset.StandardCharsets.UTF_8);
-                    String fullUriString = "https://openapi.zalo.me/v2.0" + "/oa/get_profile?data=" + encodedDataJsonString;
-                    logger.info("ZaloService - Constructed profile URI string: {}", fullUriString);
+                    String encodedDataJsonString = URLEncoder.encode(dataJsonString, StandardCharsets.UTF_8);
+                    String fullUriString = ZALO_OPENAPI_BASE_URL + "/oa/get_profile?data=" + encodedDataJsonString;
+                    logger.debug("Calling Zalo profile API: {}", fullUriString);
                     try {
                         URI uri = new URI(fullUriString);
                         return webClient.get()
@@ -205,7 +199,7 @@ public class ZaloService {
                 "&code=" + oauthCode +
                 "&grant_type=authorization_code";
 
-        return WebClient.builder().baseUrl("https://oauth.zalo.me/v4").build().post()
+        return WebClient.builder().baseUrl(ZALO_OAUTH_BASE_URL).build().post()
                 .uri("/access_token")
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .header("secret_key", zaloConfig.getAppSecret())
@@ -221,7 +215,7 @@ public class ZaloService {
                         ZaloToken savedToken = zaloTokenService.saveToken(accessToken, refreshToken, expiresIn);
                         return Mono.just(savedToken);
                     } catch (Exception e) {
-                        logger.error("Failed to parse Zalo token exchange response. Response: {}, Error: {}", response, e.getMessage());
+                        logger.error("Failed to parse Zalo token exchange response: {}", e.getMessage());
                         return Mono.error(new RuntimeException("Failed to parse Zalo token exchange response.", e));
                     }
                 })
@@ -237,9 +231,9 @@ public class ZaloService {
                     data.addProperty("offset", offset);
                     data.addProperty("count", count);
                     String dataJsonString = data.toString();
-                    String encodedDataJsonString = java.net.URLEncoder.encode(dataJsonString, java.nio.charset.StandardCharsets.UTF_8);
-                    String fullUriString = "https://openapi.zalo.me/v2.0" + "/oa/conversation?data=" + encodedDataJsonString;
-                    logger.info("ZaloService - Constructed conversation URI string: {}", fullUriString);
+                    String encodedDataJsonString = URLEncoder.encode(dataJsonString, StandardCharsets.UTF_8);
+                    String fullUriString = ZALO_OPENAPI_BASE_URL + "/oa/conversation?data=" + encodedDataJsonString;
+                    logger.debug("Calling Zalo conversation API: {}", fullUriString);
                     try {
                         URI uri = new URI(fullUriString);
                         return webClient.get()
@@ -255,7 +249,6 @@ public class ZaloService {
     }
 
     private Mono<String> getValidAccessToken() {
-        logger.info("ZaloService - Attempting to get a valid access token.");
         return Mono.justOrEmpty(zaloTokenService.getLatestToken())
                 .switchIfEmpty(Mono.error(new RuntimeException("No Zalo token found in DB. Please obtain one first.")))
                 .flatMap(token -> {
@@ -270,51 +263,45 @@ public class ZaloService {
     }
 
     public Mono<ZaloToken> refreshAccessToken() {
-        logger.info("ZaloService - Entering refreshAccessToken method.");
         logger.info("Refreshing Zalo access token...");
 
         return Mono.justOrEmpty(zaloTokenService.getLatestToken())
                 .switchIfEmpty(Mono.error(new RuntimeException("Zalo refresh token is not configured in DB.")))
                 .flatMap(token -> {
                     String refreshToken = token.getRefreshToken();
-                    logger.info("ZaloService - Refresh token from DB: {}", refreshToken != null ? refreshToken.substring(0, Math.min(refreshToken.length(), 10)) + "..." : "null");
-                    logger.info("ZaloService - App Secret from ZaloConfig: {}", zaloConfig.getAppSecret() != null ? zaloConfig.getAppSecret().substring(0, Math.min(zaloConfig.getAppSecret().length(), 10)) + "..." : "null");
                     String requestBody = "app_id=" + zaloConfig.getAppId() +
                             "&secret_key=" + zaloConfig.getAppSecret() +
                             "&refresh_token=" + refreshToken +
                             "&grant_type=refresh_token";
-                    logger.info("ZaloService - Refresh token request body: {}", requestBody);
 
-                    logger.info("ZaloService - Making WebClient call to Zalo token refresh API.");
-                    return WebClient.builder().baseUrl("https://oauth.zalo.me/v4").build().post()
+                    return WebClient.builder().baseUrl(ZALO_OAUTH_BASE_URL).build().post()
                             .uri("/access_token")
                             .header("Content-Type", "application/x-www-form-urlencoded")
                             .header("secret_key", zaloConfig.getAppSecret())
                             .bodyValue(requestBody)
                             .retrieve()
                             .bodyToMono(String.class)
-                            .doOnNext(response -> logger.info("ZaloService - Received response from Zalo token refresh API: {}", response))
                             .flatMap(response -> {
-                                logger.info("ZaloService - Attempting to parse Zalo token refresh response.");
                                 try {
                                     JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
                                     if (jsonResponse.has("access_token")) {
                                         String newAccessToken = jsonResponse.get("access_token").getAsString();
-                                    String newRefreshToken = jsonResponse.get("refresh_token").getAsString();
-                                    Long expiresIn = jsonResponse.get("expires_in").getAsLong();
-                                    ZaloToken savedToken = zaloTokenService.saveToken(newAccessToken, newRefreshToken, expiresIn);
-                                    logger.info("ZaloService - Successfully refreshed and saved new ZaloToken.");
-                                    return Mono.just(savedToken);
+                                        String newRefreshToken = jsonResponse.get("refresh_token").getAsString();
+                                        Long expiresIn = jsonResponse.get("expires_in").getAsLong();
+                                        ZaloToken savedToken = zaloTokenService.saveToken(newAccessToken, newRefreshToken, expiresIn);
+                                        logger.info("Successfully refreshed and saved new Zalo access token.");
+                                        return Mono.just(savedToken);
                                     } else {
-                                        logger.error("ZaloService - Zalo token refresh response does not contain 'access_token'. Response: {}", response);
+                                        // No access_token in the response, so it only contains Zalo error details
+                                        logger.error("Zalo token refresh response does not contain 'access_token'. Response: {}", response);
                                         return Mono.error(new RuntimeException("Zalo token refresh response does not contain 'access_token'."));
                                     }
                                 } catch (Exception e) {
-                                    logger.error("ZaloService - Failed to parse Zalo token refresh response. Response: {}, Error: {}", response, e.getMessage());
+                                    logger.error("Failed to parse Zalo token refresh response: {}", e.getMessage());
                                     return Mono.error(new RuntimeException("Failed to parse Zalo token refresh response.", e));
                                 }
                             })
-                            .doOnError(error -> logger.error("ZaloService - Error refreshing Zalo access token: {}", error.getMessage()));
+                            .doOnError(error -> logger.error("Error refreshing Zalo access token: {}", error.getMessage()));
                 });
     }
 
@@ -464,11 +451,21 @@ public class ZaloService {
 
 
 
+    /** Parses the comma-separated {@code zalo.scheduled.users} setting, ignoring blank entries. */
+    private List<String> getScheduledUserIds() {
+        String userIdsString = zaloConfig.getScheduledUsers();
+        if (userIdsString == null || userIdsString.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(userIdsString.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+    }
+
     public Flux<String> readMessages() {
-        logger.info("ZaloService - Starting readMessages process.");
-
-
-        List<String> userIds = Arrays.asList(zaloConfig.getScheduledUsers().split(","));
+        List<String> userIds = getScheduledUserIds();
+        logger.info("Reading latest messages for {} scheduled user(s).", userIds.size());
 
         return Flux.fromIterable(userIds)
                 .flatMap(userId -> getAndAnalyzeLatestMessage(userId)
@@ -487,7 +484,7 @@ public class ZaloService {
                             JsonObject latestMessage = dataArray.get(0).getAsJsonObject();
                             String messageContent = latestMessage.get("message").getAsString();
                             String messageId = latestMessage.get("msg_id").getAsString();
-                            logger.info("Extracted latest message for user {}: {}", userId, messageContent);
+                            logger.info("Extracted latest message {} for user {}", messageId, userId);
                             return analyzeMessageForDebt(messageContent, messageId)
                                 .flatMap(analysisResult -> {
                                     if (analysisResult.isTransactionRelated()) {
@@ -510,12 +507,11 @@ public class ZaloService {
 
     @Transactional
     public Mono<Void> remindUsersWithUnpaidDebts() {
-        String userIdsString = zaloConfig.getScheduledUsers();
-        if (userIdsString == null || userIdsString.isEmpty()) {
+        List<String> userIds = getScheduledUserIds();
+        if (userIds.isEmpty()) {
             logger.info("No scheduled users to remind.");
             return Mono.empty();
         }
-        List<String> userIds = Arrays.asList(zaloConfig.getScheduledUsers().split(","));
 
         return Flux.fromIterable(userIds)
                 .flatMap(userId -> {
@@ -544,6 +540,4 @@ public class ZaloService {
                 })
                 .then();
     }
-
-
-    }
+}

@@ -6,12 +6,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.beans.factory.annotation.Value;
 
-import java.util.Arrays;
-import java.util.List;
-import java.util.stream.Collectors;
-
+/**
+ * Periodically polls the latest message of each user listed in {@code zalo.scheduled.users}.
+ */
 @Component
 @EnableScheduling
 public class ZaloScheduler {
@@ -20,23 +18,13 @@ public class ZaloScheduler {
 
     private final ZaloService zaloService;
 
-    @Value("${zalo.scheduled.users:}")
-    private String scheduledUsersString;
-
     public ZaloScheduler(ZaloService zaloService) {
         this.zaloService = zaloService;
     }
 
-    @Scheduled(fixedRate = 60000) // Schedule to run every 60 seconds
+    @Scheduled(fixedRate = 60000) // every 60 seconds
     public void readMessages() {
-         logger.info("Scheduled task: Reading Zalo messages...");
-         List<String> targetUserIds = null;
-         if (scheduledUsersString != null && !scheduledUsersString.isEmpty()) {
-             targetUserIds = Arrays.stream(scheduledUsersString.split(","))
-                                   .map(String::trim)
-                                   .filter(s -> !s.isEmpty())
-                                   .collect(Collectors.toList());
-         }
-         zaloService.readMessages().subscribe();
+        logger.info("Scheduled task: Reading Zalo messages...");
+        zaloService.readMessages().subscribe();
     }
 }

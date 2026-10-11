@@ -7,13 +7,19 @@ import io.github.baoloc1993.zalobot.repository.PaymentRecordRepository;
 import io.github.baoloc1993.zalobot.repository.PendingUserConfirmationRepository;
 import io.github.baoloc1993.zalobot.repository.UserAliasRepository;
 import io.github.baoloc1993.zalobot.repository.ZaloMessageRepository;
+import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
+/**
+ * Development-only endpoints for simulating incoming messages and resetting the database.
+ * Only registered when the {@code dev} Spring profile is active.
+ */
 @RestController
+@Profile("dev")
 @RequestMapping("/simulate")
 public class UserSimulationController {
 

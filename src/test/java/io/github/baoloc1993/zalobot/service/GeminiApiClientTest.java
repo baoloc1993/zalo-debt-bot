@@ -1,11 +1,10 @@
 package io.github.baoloc1993.zalobot.service;
 
 import io.github.baoloc1993.zalobot.model.gemini.GeminiMessage;
-import io.github.baoloc1993.zalobot.model.gemini.GeminiResponse;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
+import okhttp3.mockwebserver.RecordedRequest;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -13,29 +12,28 @@ import reactor.test.StepVerifier;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-public class GeminiApiClientTest {
+class GeminiApiClientTest {
 
-    public static MockWebServer mockWebServer;
+    private MockWebServer mockWebServer;
     private GeminiApiClient geminiApiClient;
 
-    @BeforeAll
-    static void setUp() throws IOException {
+    @BeforeEach
+    void setUp() throws IOException {
         mockWebServer = new MockWebServer();
         mockWebServer.start();
-    }
-
-    @AfterAll
-    static void tearDown() throws IOException {
-        mockWebServer.shutdown();
-    }
-
-    @BeforeEach
-    void initialize() {
         String baseUrl = String.format("http://localhost:%s", mockWebServer.getPort());
         geminiApiClient = new GeminiApiClient(WebClient.builder(), "test-api-key", baseUrl);
+    }
+
+    @AfterEach
+    void tearDown() throws IOException {
+        mockWebServer.shutdown();
     }
 
     private List<GeminiMessage> createTestHistory(String prompt) {
@@ -77,5 +75,22 @@ public class GeminiApiClientTest {
         StepVerifier.create(geminiApiClient.generateContent(createTestHistory("test prompt")))
                 .expectNextMatches(s -> s.contains("Error communicating with Gemini API"))
                 .verifyComplete();
+    }
+
+    @Test
+    void generateContent_sendsApiKeyAsHeaderNotQueryParam() throws InterruptedException {
+        mockWebServer.enqueue(new MockResponse()
+                .setBody("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}")
+                .addHeader("Content-Type", "application/json"));
+
+        StepVerifier.create(geminiApiClient.generateContent(createTestHistory("test prompt")))
+                .expectNext("ok")
+                .verifyComplete();
+
+        RecordedRequest request = mockWebServer.takeRequest(5, TimeUnit.SECONDS);
+        assertNotNull(request);
+        assertEquals("test-api-key", request.getHeader("x-goog-api-key"));
+        assertEquals("/v1beta/models/gemini-2.5-flash:generateContent", request.getPath());
+        assertFalse(request.getPath().contains("key="));
     }
 }
